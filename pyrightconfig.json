@@ -1,4 +1,11 @@
 {
   "venvPath": ".",
-  "venv": ".venv"
+  "venv": ".venv",
+  "include": ["src"],
+  "executionEnvironments": [
+    {
+      "root": "src",
+      "pythonVersion": "3.10"
+    }
+  ]
 }
