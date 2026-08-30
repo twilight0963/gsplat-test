@@ -11,13 +11,13 @@ import numpy as np
 import pycolmap
 import torch
 from gsplat import rasterization
+from src.gsplat_viewer import start_viewer
 
+SH_C0 = 0.28209479177387814
 
 @dataclass
 class Capture:
     frames: list[Path]
-    width: int
-    height: int
     fps: float
 
 
@@ -32,7 +32,6 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int) -> Cap
     fps = reader.get(cv2.CAP_PROP_FPS) or 30.0
     frames: list[Path] = []
     index = 0
-    width = height = 0
     while True:
         ok, frame = reader.read()
         if not ok:
@@ -45,7 +44,6 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int) -> Cap
                     (max_width, round(frame.shape[0] * scale)),
                     interpolation=cv2.INTER_AREA,
                 )
-            height, width = frame.shape[:2]
             path = output / f"frame_{len(frames):06d}.jpg"
             if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
                 raise RuntimeError(f"Could not write frame: {path}")
@@ -54,105 +52,123 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int) -> Cap
     reader.release()
     if len(frames) < 2:
         raise RuntimeError("The video did not produce at least two usable frames")
-    metadata = {
-        "width": width,
-        "height": height,
-        "fps": fps,
-        "frames": [p.name for p in frames],
-    }
-    (output / "capture.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    return Capture(frames, width, height, fps)
+    (output / "capture.json").write_text(
+        json.dumps({"fps": fps, "frames": [p.name for p in frames]}, indent=2) + "\n"
+    )
+    return Capture(frames, fps)
 
 
-def run_colmap(capture: Path, sparse: Path) -> Path:
-    database = capture / "database.db"
+def _run(command: list[str]) -> None:
+    try:
+        subprocess.run(command, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("COLMAP is required and must be on PATH.") from exc
+
+
+def run_colmap(capture: Path, workdir: Path, vocab_tree: Path | None) -> Path:
+    database = workdir / "database.db"
+    sparse = workdir / "sparse"
     sparse.mkdir(parents=True, exist_ok=True)
-    commands = [
-        [
-            "colmap",
-            "feature_extractor",
-            "--database_path",
-            str(database),
-            "--image_path",
-            str(capture),
-        ],
-        ["colmap", "exhaustive_matcher", "--database_path", str(database)],
-        [
-            "colmap",
-            "mapper",
-            "--database_path",
-            str(database),
-            "--image_path",
-            str(capture),
-            "--output_path",
-            str(sparse),
-        ],
+
+    _run([
+        "colmap", "feature_extractor",
+        "--database_path", str(database),
+        "--image_path", str(capture),
+        "--ImageReader.single_camera", "1",
+    ])
+
+    match_command = [
+        "colmap", "sequential_matcher",
+        "--database_path", str(database),
+        "--SequentialMatching.overlap", "15",
     ]
-    for command in commands:
-        try:
-            subprocess.run(command, check=True)
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "COLMAP is required for camera poses. Install it and ensure `colmap` is on PATH."
-            ) from exc
+    if vocab_tree is not None:
+        match_command += [
+            "--SequentialMatching.loop_detection", "1",
+            "--SequentialMatching.vocab_tree_path", str(vocab_tree),
+        ]
+    _run(match_command)
+
+    _run([
+        "colmap", "mapper",
+        "--database_path", str(database),
+        "--image_path", str(capture),
+        "--output_path", str(sparse),
+    ])
+
     models = sorted(p for p in sparse.iterdir() if p.is_dir())
     if not models:
         raise RuntimeError(
             "COLMAP found no valid reconstruction; use a video with more overlap."
         )
-    return models[0]
+
+    undistorted = workdir / "undistorted"
+    _run([
+        "colmap", "image_undistorter",
+        "--image_path", str(capture),
+        "--input_path", str(models[0]),
+        "--output_path", str(undistorted),
+        "--output_type", "COLMAP",
+    ])
+    return undistorted
 
 
-def _camera_intrinsics(camera: object, width: int, height: int) -> np.ndarray:
-    params = np.asarray(camera.params, dtype=np.float32)
-    model = str(camera.model).upper()
-    if "SIMPLE_PINHOLE" in model:
-        fx = fy = params[0]
-        cx, cy = params[1:3]
-    elif "PINHOLE" in model:
-        fx, fy, cx, cy = params[:4]
-    elif "SIMPLE_RADIAL" in model or "RADIAL" in model:
-        fx = fy = params[0]
-        cx, cy = params[1:3]
-    else:
-        raise RuntimeError(f"Unsupported COLMAP camera model: {camera.model}")
-    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32).reshape(
-        3, 3
-    )
+def _subsample(means: np.ndarray, colors: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+    if means.shape[0] <= max_points:
+        return means, colors
+    keep = np.random.choice(means.shape[0], max_points, replace=False)
+    return means[keep], colors[keep]
 
 
 def load_reconstruction(
-    model_path: Path, capture: Capture
-) -> tuple[dict[str, torch.Tensor], list[Path]]:
-    reconstruction = pycolmap.Reconstruction(str(model_path))
+    undistorted: Path, max_points: int
+) -> tuple[dict[str, torch.Tensor], list[Path], int, int]:
+    reconstruction = pycolmap.Reconstruction(str(undistorted / "sparse"))
     points = list(reconstruction.points3D.values())
     if not points:
         raise RuntimeError("COLMAP produced no sparse points.")
-    means = np.stack([np.asarray(point.xyz, dtype=np.float32) for point in points])
-    colors = np.stack(
-        [np.asarray(point.color, dtype=np.float32) / 255.0 for point in points]
-    )
 
+    means = np.stack([np.asarray(p.xyz, dtype=np.float32) for p in points])
+    colors = np.stack([np.asarray(p.color, dtype=np.float32) / 255.0 for p in points])
+    means, colors = _subsample(means, colors, max_points)
+
+    image_dir = undistorted / "images"
     viewmats: list[np.ndarray] = []
     intrinsics: list[np.ndarray] = []
     images: list[Path] = []
+    width = height = 0
     for image in reconstruction.images.values():
-        frame = capture.frames[0].parent / image.name
+        frame = image_dir / image.name
         if not frame.exists():
             continue
-        viewmats.append(np.asarray(image.cam_from_world.matrix(), dtype=np.float32))
+        loaded = cv2.imread(str(frame))
+        if loaded is None:
+            continue
+        height, width = loaded.shape[:2]
+
+        mat = np.asarray(image.cam_from_world().matrix(), dtype=np.float32)
+        if mat.shape == (3, 4):
+            mat = np.vstack([mat, np.array([0, 0, 0, 1], dtype=np.float32)])
+        viewmats.append(mat)
+
         camera = reconstruction.cameras[image.camera_id]
-        intrinsics.append(_camera_intrinsics(camera, capture.width, capture.height))
+        params = np.asarray(camera.params, dtype=np.float32)
+        fx, fy, cx, cy = params[:4]
+        intrinsics.append(
+            np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+        )
         images.append(frame)
+
     if not images:
-        raise RuntimeError("No reconstructed images matched the extracted frames.")
-    return {
+        raise RuntimeError("No undistorted images matched the reconstruction.")
+
+    data = {
         "means": torch.from_numpy(means),
         "colors": torch.from_numpy(colors),
         "viewmats": torch.from_numpy(np.stack(viewmats)),
         "Ks": torch.from_numpy(np.stack(intrinsics)),
-    }, images
-
+    }
+    return data, images, width, height
 
 def train_splats(
     data: dict[str, torch.Tensor],
@@ -161,14 +177,15 @@ def train_splats(
     height: int,
     steps: int,
     device: str,
+    view_batch_size: int,
 ) -> dict[str, torch.Tensor]:
-
     if steps < 1:
         raise ValueError("--steps must be at least 1")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "gsplat training requires CUDA; run COLMAP on this machine, then train on an NVIDIA GPU."
         )
+
     target_images = []
     for path in images:
         image = cv2.imread(str(path))
@@ -177,82 +194,316 @@ def train_splats(
         target_images.append(
             torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).float() / 255.0
         )
-    target = torch.stack(target_images).to(device)
+    # Preload once. For a typical orbit capture (tens–low hundreds of views)
+    # this comfortably fits in GPU memory and removes per-step H2D transfers.
+    target_all = torch.stack(target_images).to(device)
+
     means = data["means"].to(device).requires_grad_()
-    colors = data["colors"].to(device).requires_grad_()
-    scales = torch.full_like(means, -2.5, requires_grad=True)
+    colors_init = data["colors"].numpy()
+    colors_init = np.clip(colors_init, 1e-4, 1 - 1e-4)
+    colors_logits = np.log(colors_init / (1 - colors_init)).astype(np.float32)
+    colors = torch.from_numpy(colors_logits).to(device).requires_grad_()
+
+    from scipy.spatial import cKDTree
+
+    means_np = data["means"].numpy()
+    tree = cKDTree(means_np)
+    dists, _ = tree.query(means_np, k=4)
+    mean_nn_dist = np.clip(dists[:, 1:].mean(axis=1), 1e-6, None)
+    init_scale = np.log(mean_nn_dist).astype(np.float32)
+    scales = torch.from_numpy(init_scale).to(device).unsqueeze(-1).repeat(1, 3)
+    scales = scales.detach().requires_grad_()
+
     quats = torch.zeros((means.shape[0], 4), device=device)
     quats[:, 0] = 1
     quats.requires_grad_()
     opacities = torch.full((means.shape[0],), 0.0, device=device, requires_grad=True)
-    viewmats = data["viewmats"].to(device)
-    Ks = data["Ks"].to(device)
-    optimizer = torch.optim.Adam([means, colors, scales, quats, opacities], lr=1e-2)
+
+    viewmats_all = data["viewmats"].to(device)
+    Ks_all = data["Ks"].to(device)
+    num_views = target_all.shape[0]
+    optimizer = torch.optim.Adam([
+        {"params": [means], "lr": 1.6e-4},
+        {"params": [colors], "lr": 2.5e-3},
+        {"params": [scales], "lr": 5e-3},
+        {"params": [quats], "lr": 1e-3},
+        {"params": [opacities], "lr": 5e-2},
+    ])
+    max_log_scale = float(np.log(mean_nn_dist.max() * 20))
+
+    perm = torch.randperm(num_views, device=device)
+    cursor = 0
     for _ in range(steps):
+        if cursor + view_batch_size > num_views:
+            perm = torch.randperm(num_views, device=device)
+            cursor = 0
+        idx = perm[cursor : cursor + view_batch_size]
+        cursor += view_batch_size
+
+        target = target_all[idx]
+        viewmats = viewmats_all[idx]
+        Ks = Ks_all[idx]
+
         optimizer.zero_grad(set_to_none=True)
+        quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        scales_c = scales.clamp(max=max_log_scale)
+
         rendered, _, _ = rasterization(
-            means,
-            quats,
-            scales.exp(),
-            opacities.sigmoid(),
-            colors.clamp(0, 1),
-            viewmats,
-            Ks,
-            width,
-            height,
-            packed=True,
+            means, quats_n, scales_c.exp(), opacities.sigmoid(), colors.sigmoid(),
+            viewmats, Ks, width, height, packed=True,
         )
         loss = torch.abs(rendered - target).mean()
         loss.backward()
         optimizer.step()
+
+    # viewmats_all = data["viewmats"].to(device)
+    # Ks_all = data["Ks"].to(device)
+    # num_views = target_all.shape[0]
+    # optimizer = torch.optim.Adam([
+    #     {"params": [means], "lr": 1.6e-4},
+    #     {"params": [colors], "lr": 2.5e-3},
+    #     {"params": [scales], "lr": 5e-3},
+    #     {"params": [quats], "lr": 1e-3},
+    #     {"params": [opacities], "lr": 5e-2},
+    # ])
+    # max_log_scale = float(np.log(mean_nn_dist.max() * 20))
+
+    # for _ in range(steps):
+        #     perm = torch.randperm(num_views, device=device)
+        #     for start in range(0, num_views, view_batch_size):
+            #         idx = perm[start : start + view_batch_size]
+            #         target = target_all[idx]
+            #         viewmats = viewmats_all[idx]
+            #         Ks = Ks_all[idx]
+
+    #         optimizer.zero_grad(set_to_none=True)
+    #         quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    #         scales_c = scales.clamp(max=max_log_scale)
+
+    #         rendered, _, _ = rasterization(
+    #             means,
+    #             quats_n,
+    #             scales_c.exp(),
+    #             opacities.sigmoid(),
+    #             colors.sigmoid(),
+    #             viewmats,
+    #             Ks,
+    #             width,
+    #             height,
+    #             packed=True,
+    #         )
+    #         loss = torch.abs(rendered - target).mean()
+    #         loss.backward()
+    #         optimizer.step()
+
+    with torch.no_grad():
+            quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+            scales.copy_(scales.clamp(max=max_log_scale))
+
     return {
-        k: v.detach().cpu()
-        for k, v in {
-            "means": means,
-            "colors": colors,
-            "scales": scales,
-            "quats": quats,
-            "opacities": opacities,
-            "viewmats": viewmats,
-            "Ks": Ks,
-        }.items()
+        "means": means.detach().cpu(),
+        "colors": colors.detach().sigmoid().cpu(),
+        "scales": scales.detach().cpu(),
+        "quats": quats.detach().cpu(),
+        "opacities": opacities.detach().cpu(),
     }
+
+# def train_splats(
+#     data: dict[str, torch.Tensor],
+#     images: list[Path],
+#     width: int,
+#     height: int,
+#     steps: int,
+#     device: str,
+#     view_batch_size: int,
+# ) -> dict[str, torch.Tensor]:
+#     if steps < 1:
+#         raise ValueError("--steps must be at least 1")
+#     if device == "cuda" and not torch.cuda.is_available():
+#         raise RuntimeError(
+#             "gsplat training requires CUDA; run COLMAP on this machine, then train on an NVIDIA GPU."
+#         )
+
+#     target_images = []
+#     for path in images:
+#         image = cv2.imread(str(path))
+#         if image is None:
+#             raise RuntimeError(f"Could not read reconstructed frame: {path}")
+#         target_images.append(
+#             torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).float() / 255.0
+#         )
+#     target_all = torch.stack(target_images)
+
+#     means = data["means"].to(device).requires_grad_()
+#     colors_init = data["colors"].numpy()
+#     colors_init = np.clip(colors_init, 1e-4, 1 - 1e-4)
+#     colors_logits = np.log(colors_init / (1 - colors_init)).astype(np.float32)
+#     colors = torch.from_numpy(colors_logits).to(device).requires_grad_()
+
+#     from scipy.spatial import cKDTree
+
+#     means_np = data["means"].numpy()
+#     tree = cKDTree(means_np)
+#     dists, _ = tree.query(means_np, k=4)
+#     mean_nn_dist = np.clip(dists[:, 1:].mean(axis=1), 1e-6, None)
+#     init_scale = np.log(mean_nn_dist).astype(np.float32)
+#     scales = torch.from_numpy(init_scale).to(device).unsqueeze(-1).repeat(1, 3)
+#     scales = scales.detach().requires_grad_()
+
+#     quats = torch.zeros((means.shape[0], 4), device=device)
+#     quats[:, 0] = 1
+#     quats.requires_grad_()
+#     opacities = torch.full((means.shape[0],), 0.0, device=device, requires_grad=True)
+
+#     viewmats_all = data["viewmats"]
+#     Ks_all = data["Ks"]
+#     num_views = target_all.shape[0]
+#     optimizer = torch.optim.Adam([
+#         {"params": [means], "lr": 1.6e-4},
+#         {"params": [colors], "lr": 2.5e-3},
+#         {"params": [scales], "lr": 5e-3},
+#         {"params": [quats], "lr": 1e-3},
+#         {"params": [opacities], "lr": 5e-2},
+#     ])
+#     max_log_scale = float(np.log(mean_nn_dist.max() * 20))
+
+#     for _ in range(steps):
+#         perm = torch.randperm(num_views)
+#         for start in range(0, num_views, view_batch_size):
+#             idx = perm[start : start + view_batch_size]
+#             target = target_all[idx].to(device)
+#             viewmats = viewmats_all[idx].to(device)
+#             Ks = Ks_all[idx].to(device)
+
+#             optimizer.zero_grad(set_to_none=True)
+#             quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+#             scales_c = scales.clamp(max=max_log_scale)
+
+#             rendered, _, _ = rasterization(
+#                 means,
+#                 quats_n,
+#                 scales_c.exp(),
+#                 opacities.sigmoid(),
+#                 colors.sigmoid(),
+#                 viewmats,
+#                 Ks,
+#                 width,
+#                 height,
+#                 packed=True,
+#             )
+#             loss = torch.abs(rendered - target).mean()
+#             loss.backward()
+#             optimizer.step()
+
+#             del rendered, target, viewmats, Ks
+#             if device == "cuda":
+#                 torch.cuda.empty_cache()
+
+#     with torch.no_grad():
+#         quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+#         scales.copy_(scales.clamp(max=max_log_scale))
+
+#     return {
+#         "means": means.detach().cpu(),
+#         "colors": colors.detach().sigmoid().cpu(),
+#         "scales": scales.detach().cpu(),
+#         "quats": quats.detach().cpu(),
+#         "opacities": opacities.detach().cpu(),
+#     }
+
+
+def export_ply(result: dict[str, torch.Tensor], path: Path) -> None:
+    means = result["means"].numpy().astype(np.float32)
+    colors = result["colors"].numpy().astype(np.float32)
+    scales = result["scales"].numpy().astype(np.float32)
+    quats = result["quats"].numpy().astype(np.float32)
+    opacities = result["opacities"].numpy().astype(np.float32)
+
+    n = means.shape[0]
+    colors_clamped = np.clip(colors, 0.0, 1.0)
+    f_dc = (colors - 0.5) / SH_C0
+    rgb_u8 = np.round(colors_clamped * 255.0).astype(np.uint8)
+    normals = np.zeros_like(means)
+
+    float_fields = [
+        "x", "y", "z", "nx", "ny", "nz",
+        "f_dc_0", "f_dc_1", "f_dc_2",
+        "opacity", "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3",
+    ]
+    dtype = [(name, "f4") for name in float_fields] + [
+        ("red", "u1"), ("green", "u1"), ("blue", "u1")
+    ]
+    vertex = np.empty(n, dtype=dtype)
+    vertex["x"], vertex["y"], vertex["z"] = means[:, 0], means[:, 1], means[:, 2]
+    vertex["nx"], vertex["ny"], vertex["nz"] = normals[:, 0], normals[:, 1], normals[:, 2]
+    vertex["f_dc_0"], vertex["f_dc_1"], vertex["f_dc_2"] = f_dc[:, 0], f_dc[:, 1], f_dc[:, 2]
+    vertex["opacity"] = opacities
+    vertex["scale_0"], vertex["scale_1"], vertex["scale_2"] = scales[:, 0], scales[:, 1], scales[:, 2]
+    vertex["rot_0"], vertex["rot_1"], vertex["rot_2"], vertex["rot_3"] = (
+        quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+    )
+    vertex["red"], vertex["green"], vertex["blue"] = rgb_u8[:, 0], rgb_u8[:, 1], rgb_u8[:, 2]
+
+    header = "\n".join(
+        ["ply", "format binary_little_endian 1.0", f"element vertex {n}"]
+        + [f"property float {name}" for name in float_fields]
+        + ["property uchar red", "property uchar green", "property uchar blue"]
+        + ["end_header\n"]
+    )
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(vertex.tobytes())
 
 
 def build_model(
     video: Path,
     output: Path,
     every: int = 5,
-    max_width: int = 1920,
-    steps: int = 100,
+    max_width: int = 1280,
+    steps: int = 5000,
     device: str = "cuda",
+    view_batch_size: int = 4,
+    max_points: int = 100_000,
+    vocab_tree: Path | None = None,
 ) -> Path:
     capture_dir = output / "capture"
     capture = extract_frames(video, capture_dir, every, max_width)
-    model = run_colmap(capture_dir, output / "sparse")
-    data, images = load_reconstruction(model, capture)
-    result = train_splats(data, images, capture.width, capture.height, steps, device)
-    checkpoint = output / "model.pt"
-    torch.save(result, checkpoint)
-    return checkpoint
+    undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
+    data, images, width, height = load_reconstruction(undistorted, max_points)
+    result = train_splats(data, images, width, height, steps, device, view_batch_size)
+    ply_path = output / "model.ply"
+    print("Exporting model...")
+    export_ply(result, ply_path)
+    start_viewer(ply_path, width, height)
+    return ply_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a Gaussian splat model from a video."
+        description="Build a Gaussian splat model from a drone orbit video."
     )
     parser.add_argument("video", type=Path)
     parser.add_argument("--output", type=Path, default=Path("runs/gsplat"))
-    parser.add_argument(
-        "--every", type=int, default=5, help="Keep every Nth video frame."
-    )
-    parser.add_argument("--max-width", type=int, default=1920)
-    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--every", type=int, default=5, help="Keep every Nth video frame.")
+    parser.add_argument("--max-width", type=int, default=1280)
+    parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--view-batch-size", type=int, default=2)
+    parser.add_argument("--max-points", type=int, default=200_000)
+    parser.add_argument("--vocab-tree", type=Path, default=None)
     args = parser.parse_args()
     print(
         build_model(
-            args.video, args.output, args.every, args.max_width, args.steps, args.device
+            args.video,
+            args.output,
+            args.every,
+            args.max_width,
+            args.steps,
+            args.device,
+            args.view_batch_size,
+            args.max_points,
+            args.vocab_tree,
         )
     )
 
