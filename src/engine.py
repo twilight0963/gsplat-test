@@ -183,7 +183,7 @@ def train_splats(
         raise ValueError("--steps must be at least 1")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "gsplat training requires CUDA; run COLMAP on this machine, then train on an NVIDIA GPU."
+            "gsplat training requires CUDA"
         )
 
     target_images = []
@@ -256,46 +256,6 @@ def train_splats(
         loss.backward()
         optimizer.step()
 
-    # viewmats_all = data["viewmats"].to(device)
-    # Ks_all = data["Ks"].to(device)
-    # num_views = target_all.shape[0]
-    # optimizer = torch.optim.Adam([
-    #     {"params": [means], "lr": 1.6e-4},
-    #     {"params": [colors], "lr": 2.5e-3},
-    #     {"params": [scales], "lr": 5e-3},
-    #     {"params": [quats], "lr": 1e-3},
-    #     {"params": [opacities], "lr": 5e-2},
-    # ])
-    # max_log_scale = float(np.log(mean_nn_dist.max() * 20))
-
-    # for _ in range(steps):
-        #     perm = torch.randperm(num_views, device=device)
-        #     for start in range(0, num_views, view_batch_size):
-            #         idx = perm[start : start + view_batch_size]
-            #         target = target_all[idx]
-            #         viewmats = viewmats_all[idx]
-            #         Ks = Ks_all[idx]
-
-    #         optimizer.zero_grad(set_to_none=True)
-    #         quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    #         scales_c = scales.clamp(max=max_log_scale)
-
-    #         rendered, _, _ = rasterization(
-    #             means,
-    #             quats_n,
-    #             scales_c.exp(),
-    #             opacities.sigmoid(),
-    #             colors.sigmoid(),
-    #             viewmats,
-    #             Ks,
-    #             width,
-    #             height,
-    #             packed=True,
-    #         )
-    #         loss = torch.abs(rendered - target).mean()
-    #         loss.backward()
-    #         optimizer.step()
-
     with torch.no_grad():
             quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
             scales.copy_(scales.clamp(max=max_log_scale))
@@ -307,110 +267,6 @@ def train_splats(
         "quats": quats.detach().cpu(),
         "opacities": opacities.detach().cpu(),
     }
-
-# def train_splats(
-#     data: dict[str, torch.Tensor],
-#     images: list[Path],
-#     width: int,
-#     height: int,
-#     steps: int,
-#     device: str,
-#     view_batch_size: int,
-# ) -> dict[str, torch.Tensor]:
-#     if steps < 1:
-#         raise ValueError("--steps must be at least 1")
-#     if device == "cuda" and not torch.cuda.is_available():
-#         raise RuntimeError(
-#             "gsplat training requires CUDA; run COLMAP on this machine, then train on an NVIDIA GPU."
-#         )
-
-#     target_images = []
-#     for path in images:
-#         image = cv2.imread(str(path))
-#         if image is None:
-#             raise RuntimeError(f"Could not read reconstructed frame: {path}")
-#         target_images.append(
-#             torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).float() / 255.0
-#         )
-#     target_all = torch.stack(target_images)
-
-#     means = data["means"].to(device).requires_grad_()
-#     colors_init = data["colors"].numpy()
-#     colors_init = np.clip(colors_init, 1e-4, 1 - 1e-4)
-#     colors_logits = np.log(colors_init / (1 - colors_init)).astype(np.float32)
-#     colors = torch.from_numpy(colors_logits).to(device).requires_grad_()
-
-#     from scipy.spatial import cKDTree
-
-#     means_np = data["means"].numpy()
-#     tree = cKDTree(means_np)
-#     dists, _ = tree.query(means_np, k=4)
-#     mean_nn_dist = np.clip(dists[:, 1:].mean(axis=1), 1e-6, None)
-#     init_scale = np.log(mean_nn_dist).astype(np.float32)
-#     scales = torch.from_numpy(init_scale).to(device).unsqueeze(-1).repeat(1, 3)
-#     scales = scales.detach().requires_grad_()
-
-#     quats = torch.zeros((means.shape[0], 4), device=device)
-#     quats[:, 0] = 1
-#     quats.requires_grad_()
-#     opacities = torch.full((means.shape[0],), 0.0, device=device, requires_grad=True)
-
-#     viewmats_all = data["viewmats"]
-#     Ks_all = data["Ks"]
-#     num_views = target_all.shape[0]
-#     optimizer = torch.optim.Adam([
-#         {"params": [means], "lr": 1.6e-4},
-#         {"params": [colors], "lr": 2.5e-3},
-#         {"params": [scales], "lr": 5e-3},
-#         {"params": [quats], "lr": 1e-3},
-#         {"params": [opacities], "lr": 5e-2},
-#     ])
-#     max_log_scale = float(np.log(mean_nn_dist.max() * 20))
-
-#     for _ in range(steps):
-#         perm = torch.randperm(num_views)
-#         for start in range(0, num_views, view_batch_size):
-#             idx = perm[start : start + view_batch_size]
-#             target = target_all[idx].to(device)
-#             viewmats = viewmats_all[idx].to(device)
-#             Ks = Ks_all[idx].to(device)
-
-#             optimizer.zero_grad(set_to_none=True)
-#             quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-#             scales_c = scales.clamp(max=max_log_scale)
-
-#             rendered, _, _ = rasterization(
-#                 means,
-#                 quats_n,
-#                 scales_c.exp(),
-#                 opacities.sigmoid(),
-#                 colors.sigmoid(),
-#                 viewmats,
-#                 Ks,
-#                 width,
-#                 height,
-#                 packed=True,
-#             )
-#             loss = torch.abs(rendered - target).mean()
-#             loss.backward()
-#             optimizer.step()
-
-#             del rendered, target, viewmats, Ks
-#             if device == "cuda":
-#                 torch.cuda.empty_cache()
-
-#     with torch.no_grad():
-#         quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
-#         scales.copy_(scales.clamp(max=max_log_scale))
-
-#     return {
-#         "means": means.detach().cpu(),
-#         "colors": colors.detach().sigmoid().cpu(),
-#         "scales": scales.detach().cpu(),
-#         "quats": quats.detach().cpu(),
-#         "opacities": opacities.detach().cpu(),
-#     }
-
 
 def export_ply(result: dict[str, torch.Tensor], path: Path) -> None:
     means = result["means"].numpy().astype(np.float32)
@@ -460,8 +316,8 @@ def build_model(
     video: Path,
     output: Path,
     every: int = 5,
-    max_width: int = 1280,
-    steps: int = 5000,
+    max_width: int = 1920,
+    steps: int = 2000,
     device: str = "cuda",
     view_batch_size: int = 4,
     max_points: int = 100_000,
@@ -481,7 +337,7 @@ def build_model(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a Gaussian splat model from a drone orbit video."
+        description="Build a Gaussian splat model from a drone video."
     )
     parser.add_argument("video", type=Path)
     parser.add_argument("--output", type=Path, default=Path("runs/gsplat"))
@@ -489,8 +345,8 @@ def main() -> None:
     parser.add_argument("--max-width", type=int, default=1280)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--view-batch-size", type=int, default=2)
-    parser.add_argument("--max-points", type=int, default=200_000)
+    parser.add_argument("--view-batch-size", type=int, default=4)
+    parser.add_argument("--max-points", type=int, default=100_000)
     parser.add_argument("--vocab-tree", type=Path, default=None)
     args = parser.parse_args()
     print(

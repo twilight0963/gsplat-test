@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import torch
 from gsplat import rasterization
+import argparse
 
 SH_C0 = 0.28209479177387814
 
@@ -175,10 +176,10 @@ def start_viewer(
     state = {"dragging": None, "last": (0, 0)}
 
     def on_mouse(event, x, y, flags, _param):
-        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MBUTTONDOWN):
             state["dragging"] = "orbit" if event == cv2.EVENT_LBUTTONDOWN else "pan"
             state["last"] = (x, y)
-        elif event in (cv2.EVENT_LBUTTONUP, cv2.EVENT_RBUTTONUP):
+        elif event in (cv2.EVENT_LBUTTONUP, cv2.EVENT_MBUTTONUP):
             state["dragging"] = None
         elif event == cv2.EVENT_MOUSEMOVE and state["dragging"]:
             lx, ly = state["last"]
@@ -222,4 +223,9 @@ def start_viewer(
 
 
 if __name__ == "__main__":
-    start_viewer("runs/scene/model.ply")
+    parser = argparse.ArgumentParser(
+        description="Show a gsplat model in the viewer"
+    )
+    parser.add_argument("model_path", type=Path, default=Path("runs/scene/model.ply"))
+    args = parser.parse_args()
+    start_viewer(args.model_path)
