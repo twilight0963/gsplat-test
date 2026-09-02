@@ -14,13 +14,7 @@ from gsplat import rasterization
 from src.gsplat_viewer import start_viewer
 from src.gltf_gsplat import write_gsplat_glb
 
-@dataclass
-class Capture:
-    frames: list[Path]
-    fps: float
-
-
-def extract_frames(video: Path, output: Path, every: int, max_width: int) -> Capture:
+def extract_frames(video: Path, output: Path, every: int, max_width: int):
     if every < 1:
         raise ValueError("--every must be at least 1")
     output.mkdir(parents=True, exist_ok=True)
@@ -54,7 +48,6 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int) -> Cap
     (output / "capture.json").write_text(
         json.dumps({"fps": fps, "frames": [p.name for p in frames]}, indent=2) + "\n"
     )
-    return Capture(frames, fps)
 
 
 def _run(command: list[str]) -> None:
@@ -193,8 +186,8 @@ def train_splats(
         target_images.append(
             torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).float() / 255.0
         )
-    
-    
+
+
     target_all = torch.stack(target_images).to(device)
 
     means = data["means"].to(device).requires_grad_()
@@ -269,7 +262,7 @@ def train_splats(
 
 def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     means = result["means"].numpy().astype(np.float32)
-    colors = result["colors"].numpy().astype(np.float32)  
+    colors = result["colors"].numpy().astype(np.float32)
     scales = np.exp(result["scales"].numpy().astype(np.float32))
     quats = result["quats"].numpy().astype(np.float32)
     opacities = torch.sigmoid(result["opacities"]).numpy().astype(np.float32)
@@ -284,12 +277,12 @@ def build_model(
     max_width: int = 1920,
     steps: int = 2000,
     device: str = "cuda",
-    view_batch_size: int = 4,
-    max_points: int = 100_000,
+    view_batch_size: int = 2,
+    max_points: int = 200_000,
     vocab_tree: Path | None = None,
 ) -> Path:
     capture_dir = output / "capture"
-    capture = extract_frames(video, capture_dir, every, max_width)
+    extract_frames(video, capture_dir, every, max_width)
     undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
     data, images, width, height = load_reconstruction(undistorted, max_points)
     result = train_splats(data, images, width, height, steps, device, view_batch_size)

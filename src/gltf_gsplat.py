@@ -131,11 +131,11 @@ def write_gsplat_glb(
 
     total_len = 12 + 8 + len(json_chunk) + 8 + len(bin_chunk)
     with open(path, "wb") as f:
-        f.write(struct.pack("<III", _GLB_MAGIC, 2, total_len))
-        f.write(struct.pack("<II", len(json_chunk), _CHUNK_JSON))
-        f.write(json_chunk)
-        f.write(struct.pack("<II", len(bin_chunk), _CHUNK_BIN))
-        f.write(bin_chunk)
+        _ = f.write(struct.pack("<III", _GLB_MAGIC, 2, total_len))
+        _ = f.write(struct.pack("<II", len(json_chunk), _CHUNK_JSON))
+        _ = f.write(json_chunk)
+        _ = f.write(struct.pack("<II", len(bin_chunk), _CHUNK_BIN))
+        _ = f.write(bin_chunk)
 
 
 def read_gsplat_glb(path: Path) -> dict[str, torch.Tensor]:
