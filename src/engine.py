@@ -12,8 +12,7 @@ import pycolmap
 import torch
 from gsplat import rasterization
 from src.gsplat_viewer import start_viewer
-
-SH_C0 = 0.28209479177387814
+from src.gltf_gsplat import write_gsplat_glb
 
 @dataclass
 class Capture:
@@ -183,7 +182,7 @@ def train_splats(
         raise ValueError("--steps must be at least 1")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "gsplat training requires CUDA"
+            "gsplat training requres CUDA"
         )
 
     target_images = []
@@ -194,8 +193,8 @@ def train_splats(
         target_images.append(
             torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).float() / 255.0
         )
-    # Preload once. For a typical orbit capture (tens–low hundreds of views)
-    # this comfortably fits in GPU memory and removes per-step H2D transfers.
+    
+    
     target_all = torch.stack(target_images).to(device)
 
     means = data["means"].to(device).requires_grad_()
@@ -268,48 +267,14 @@ def train_splats(
         "opacities": opacities.detach().cpu(),
     }
 
-def export_ply(result: dict[str, torch.Tensor], path: Path) -> None:
+def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     means = result["means"].numpy().astype(np.float32)
-    colors = result["colors"].numpy().astype(np.float32)
-    scales = result["scales"].numpy().astype(np.float32)
+    colors = result["colors"].numpy().astype(np.float32)  
+    scales = np.exp(result["scales"].numpy().astype(np.float32))
     quats = result["quats"].numpy().astype(np.float32)
-    opacities = result["opacities"].numpy().astype(np.float32)
+    opacities = torch.sigmoid(result["opacities"]).numpy().astype(np.float32)
 
-    n = means.shape[0]
-    colors_clamped = np.clip(colors, 0.0, 1.0)
-    f_dc = (colors - 0.5) / SH_C0
-    rgb_u8 = np.round(colors_clamped * 255.0).astype(np.uint8)
-    normals = np.zeros_like(means)
-
-    float_fields = [
-        "x", "y", "z", "nx", "ny", "nz",
-        "f_dc_0", "f_dc_1", "f_dc_2",
-        "opacity", "scale_0", "scale_1", "scale_2",
-        "rot_0", "rot_1", "rot_2", "rot_3",
-    ]
-    dtype = [(name, "f4") for name in float_fields] + [
-        ("red", "u1"), ("green", "u1"), ("blue", "u1")
-    ]
-    vertex = np.empty(n, dtype=dtype)
-    vertex["x"], vertex["y"], vertex["z"] = means[:, 0], means[:, 1], means[:, 2]
-    vertex["nx"], vertex["ny"], vertex["nz"] = normals[:, 0], normals[:, 1], normals[:, 2]
-    vertex["f_dc_0"], vertex["f_dc_1"], vertex["f_dc_2"] = f_dc[:, 0], f_dc[:, 1], f_dc[:, 2]
-    vertex["opacity"] = opacities
-    vertex["scale_0"], vertex["scale_1"], vertex["scale_2"] = scales[:, 0], scales[:, 1], scales[:, 2]
-    vertex["rot_0"], vertex["rot_1"], vertex["rot_2"], vertex["rot_3"] = (
-        quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
-    )
-    vertex["red"], vertex["green"], vertex["blue"] = rgb_u8[:, 0], rgb_u8[:, 1], rgb_u8[:, 2]
-
-    header = "\n".join(
-        ["ply", "format binary_little_endian 1.0", f"element vertex {n}"]
-        + [f"property float {name}" for name in float_fields]
-        + ["property uchar red", "property uchar green", "property uchar blue"]
-        + ["end_header\n"]
-    )
-    with open(path, "wb") as f:
-        f.write(header.encode("ascii"))
-        f.write(vertex.tobytes())
+    write_gsplat_glb(path, means, scales, quats, opacities, colors)
 
 
 def build_model(
@@ -328,11 +293,11 @@ def build_model(
     undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
     data, images, width, height = load_reconstruction(undistorted, max_points)
     result = train_splats(data, images, width, height, steps, device, view_batch_size)
-    ply_path = output / "model.ply"
+    glb_path = output / "model.glb"
     print("Exporting model...")
-    export_ply(result, ply_path)
-    start_viewer(ply_path, width, height)
-    return ply_path
+    export_gltf(result, glb_path)
+    start_viewer(glb_path, width, height)
+    return glb_path
 
 
 def main() -> None:

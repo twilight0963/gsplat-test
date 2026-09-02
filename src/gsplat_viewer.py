@@ -8,82 +8,7 @@ import torch
 from gsplat import rasterization
 import argparse
 
-SH_C0 = 0.28209479177387814
-
-PLY_TYPE_MAP = {
-    "float": "f4", "float32": "f4",
-    "double": "f8", "float64": "f8",
-    "uchar": "u1", "uint8": "u1",
-    "char": "i1", "int8": "i1",
-    "short": "i2", "int16": "i2",
-    "ushort": "u2", "uint16": "u2",
-    "int": "i4", "int32": "i4",
-    "uint": "u4", "uint32": "u4",
-}
-
-
-def load_ply(path: Path) -> dict[str, torch.Tensor]:
-    with open(path, "rb") as f:
-        raw = f.read()
-
-    header_end = raw.find(b"end_header\n") + len(b"end_header\n")
-    header = raw[:header_end].decode("ascii", errors="ignore")
-    lines = [l.strip() for l in header.splitlines()]
-
-    if "format binary_little_endian 1.0" not in header:
-        raise ValueError("Only binary_little_endian PLY is supported by this viewer.")
-
-    n_vertex = 0
-    fields: list[tuple[str, str]] = []
-    in_vertex_element = False
-    for line in lines:
-        if line.startswith("element vertex"):
-            n_vertex = int(line.split()[-1])
-            in_vertex_element = True
-        elif line.startswith("element") and not line.startswith("element vertex"):
-            in_vertex_element = False
-        elif line.startswith("property") and in_vertex_element:
-            _, ptype, pname = line.split()
-            fields.append((pname, PLY_TYPE_MAP[ptype]))
-
-    dtype = np.dtype(fields)
-    data = np.frombuffer(raw, dtype=dtype, count=n_vertex, offset=header_end)
-    names = set(data.dtype.names)
-
-    means = np.stack([data["x"], data["y"], data["z"]], axis=1).astype(np.float32)
-
-    has_gaussian_fields = {"f_dc_0", "opacity", "scale_0", "rot_0"} <= names
-    if has_gaussian_fields:
-        f_dc = np.stack([data["f_dc_0"], data["f_dc_1"], data["f_dc_2"]], axis=1)
-        colors = np.clip(SH_C0 * f_dc + 0.5, 0.0, 1.0).astype(np.float32)
-        opacities = 1.0 / (1.0 + np.exp(-data["opacity"].astype(np.float32)))
-        scales = np.exp(
-            np.stack([data["scale_0"], data["scale_1"], data["scale_2"]], axis=1).astype(np.float32)
-        )
-        quats = np.stack(
-            [data["rot_0"], data["rot_1"], data["rot_2"], data["rot_3"]], axis=1
-        ).astype(np.float32)
-        quats /= np.clip(np.linalg.norm(quats, axis=1, keepdims=True), 1e-8, None)
-    else:
-        # Plain colored point cloud (e.g. a raw COLMAP sparse.ply) - fake it as
-        # small, opaque, isotropic gaussians so the same viewer still works.
-        if {"red", "green", "blue"} <= names:
-            colors = np.stack([data["red"], data["green"], data["blue"]], axis=1).astype(np.float32) / 255.0
-        else:
-            colors = np.ones((n_vertex, 3), dtype=np.float32) * 0.7
-        nn = max(np.ptp(means, axis=0).mean() / max(n_vertex ** (1 / 3), 1.0), 1e-4)
-        scales = np.full((n_vertex, 3), nn, dtype=np.float32)
-        quats = np.zeros((n_vertex, 4), dtype=np.float32)
-        quats[:, 0] = 1.0
-        opacities = np.ones(n_vertex, dtype=np.float32)
-
-    return {
-        "means": torch.from_numpy(means),
-        "colors": torch.from_numpy(colors),
-        "scales": torch.from_numpy(scales),
-        "quats": torch.from_numpy(quats),
-        "opacities": torch.from_numpy(opacities),
-    }
+from src.gltf_gsplat import read_gsplat_glb
 
 
 class OrbitCamera:
@@ -115,7 +40,7 @@ class OrbitCamera:
         z_axis /= max(np.linalg.norm(z_axis), 1e-8)
         x_axis = np.cross(world_up, z_axis)
         x_axis /= max(np.linalg.norm(x_axis), 1e-8)
-        y_axis = np.cross(z_axis, x_axis)  # "down" in camera space
+        y_axis = np.cross(z_axis, x_axis)
 
         R = np.stack([x_axis, y_axis, z_axis], axis=0)
         t = -R @ eye
@@ -144,18 +69,18 @@ def make_K(width: int, height: int, fov_deg: float) -> np.ndarray:
 
 
 def start_viewer(
-    ply: Path | str,
+    glb: Path | str,
     width: int = 1920,
     height: int = 1080,
     fov: float = 30.0,
 ) -> None:
-    ply = Path(ply)
+    glb = Path(glb)
 
     if not torch.cuda.is_available():
         raise RuntimeError("This viewer needs a CUDA GPU (gsplat's rasterizer is CUDA-only).")
     device = "cuda"
 
-    data = load_ply(ply)
+    data = read_gsplat_glb(glb)
     means = data["means"].to(device)
     quats = data["quats"].to(device)
     scales = data["scales"].to(device)
@@ -226,6 +151,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Show a gsplat model in the viewer"
     )
-    parser.add_argument("model_path", type=Path, default=Path("runs/scene/model.ply"))
+    parser.add_argument("model_path", type=Path, default=Path("runs/scene/model.glb"))
     args = parser.parse_args()
     start_viewer(args.model_path)
