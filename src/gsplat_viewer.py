@@ -45,7 +45,7 @@ class OrbitCamera:
         z_axis /= max(np.linalg.norm(z_axis), 1e-8)
         x_axis = np.cross(world_up, z_axis)
         x_axis /= max(np.linalg.norm(x_axis), 1e-8)
-        y_axis = np.cross(z_axis, x_axis)  
+        y_axis = np.cross(z_axis, x_axis)
 
         if self.roll:
             cr, sr = np.cos(self.roll), np.sin(self.roll)
@@ -139,12 +139,12 @@ def start_viewer(
 
     window = "gsplat viewer"
     try:
-        
-        
-        
-        
-        
-        
+
+
+
+
+
+
         cv2.namedWindow(window, cv2.WINDOW_OPENGL | cv2.WINDOW_NORMAL)
     except cv2.error:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
@@ -184,10 +184,10 @@ def start_viewer(
                 means, quats, scales, opacities, colors,
                 viewmat, K_t, render_w, render_h, packed=True,
             )
-            
-            
-            
-            
+
+
+
+
             frame_bgr_gpu = rendered[0].clamp(0, 1).mul(255.0).to(torch.uint8)[..., [2, 1, 0]]
         frame_bgr = frame_bgr_gpu.contiguous().cpu().numpy()
 

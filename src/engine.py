@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,12 +11,14 @@ import cv2
 import numpy as np
 import pycolmap
 import torch
+import torch.nn.functional as F
 from gsplat import rasterization
 from src.gsplat_viewer import start_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
 
-def extract_frames(video: Path, output: Path, every: int, max_width: int):
+
+def extract_frames(video: Path, output: Path, every: int, max_width: int) -> Path:
     if every < 1:
         raise ValueError("--every must be at least 1")
     output.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,7 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int):
     (output / "capture.json").write_text(
         json.dumps({"fps": fps, "frames": [p.name for p in frames]}, indent=2) + "\n"
     )
+    return output
 
 
 def _run(command: list[str]) -> None:
@@ -58,10 +62,13 @@ def _run(command: list[str]) -> None:
         raise RuntimeError("COLMAP is required and must be on PATH.") from exc
 
 
-def run_colmap(capture: Path, workdir: Path, vocab_tree: Path | None) -> Path:
+def run_colmap(
+    capture: Path, workdir: Path, vocab_tree: Path | None, use_gpu: bool = True
+) -> Path:
     database = workdir / "database.db"
     sparse = workdir / "sparse"
     sparse.mkdir(parents=True, exist_ok=True)
+    gpu_flag = "1" if use_gpu else "0"
 
     _run([
         "colmap", "feature_extractor",
@@ -135,14 +142,18 @@ def load_reconstruction(
     intrinsics: list[np.ndarray] = []
     images: list[Path] = []
     width = height = 0
+    
+    
     for image in reconstruction.images.values():
         frame = image_dir / image.name
         if not frame.exists():
             continue
-        loaded = cv2.imread(str(frame))
-        if loaded is None:
-            continue
-        height, width = loaded.shape[:2]
+
+        if width == 0:
+            loaded = cv2.imread(str(frame))
+            if loaded is None:
+                continue
+            height, width = loaded.shape[:2]
 
         mat = np.asarray(image.cam_from_world().matrix(), dtype=np.float32)
         if mat.shape == (3, 4):
@@ -168,6 +179,63 @@ def load_reconstruction(
     }
     return data, images, width, height
 
+
+def _read_rgb_uint8(path: Path) -> torch.Tensor:
+    image = cv2.imread(str(path))
+    if image is None:
+        raise RuntimeError(f"Could not read reconstructed frame: {path}")
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(rgb)  
+
+
+def _load_targets_parallel(images: list[Path]) -> torch.Tensor:
+    
+    
+    
+    with ThreadPoolExecutor() as pool:
+        frames = list(pool.map(_read_rgb_uint8, images))
+    return torch.stack(frames)
+
+
+def _ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    pad = window_size // 2
+    mu1 = F.avg_pool2d(img1, window_size, stride=1, padding=pad)
+    mu2 = F.avg_pool2d(img2, window_size, stride=1, padding=pad)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1 * mu1, mu2 * mu2, mu1 * mu2
+    sigma1_sq = F.avg_pool2d(img1 * img1, window_size, stride=1, padding=pad) - mu1_sq
+    sigma2_sq = F.avg_pool2d(img2 * img2, window_size, stride=1, padding=pad) - mu2_sq
+    sigma12 = F.avg_pool2d(img1 * img2, window_size, stride=1, padding=pad) - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+        (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+    )
+    return ssim_map.mean()
+
+
+def _means_lr(step: int, steps: int, lr_init: float, lr_final_ratio: float) -> float:
+    
+    t = min(step / max(steps - 1, 1), 1.0)
+    return lr_init * (lr_final_ratio ** t)
+
+
+def _reset_opacities(
+    opacities: torch.Tensor, optimizer: torch.optim.Optimizer, value: float = 0.01
+) -> None:
+    
+    
+    
+    inv_sigmoid = float(np.log(value / (1 - value)))
+    with torch.no_grad():
+        opacities.data.fill_(inv_sigmoid)
+    for group in optimizer.param_groups:
+        if group.get("name") == "opacities":
+            for p in group["params"]:
+                state = optimizer.state.get(p)
+                if state:
+                    state["exp_avg"].zero_()
+                    state["exp_avg_sq"].zero_()
+
+
 def train_splats(
     data: dict[str, torch.Tensor],
     images: list[Path],
@@ -178,6 +246,11 @@ def train_splats(
     view_batch_size: int,
     voxel_guided: bool = True,
     voxel_config: VoxelGuidedConfig | None = None,
+    means_lr_init: float = 1.6e-4,
+    means_lr_final_ratio: float = 0.01,
+    ssim_weight: float = 0.2,
+    opacity_reset_interval: int = 3000,
+    mixed_precision: bool = True,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -185,18 +258,10 @@ def train_splats(
         raise RuntimeError(
             "gsplat training requires CUDA"
         )
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
 
-    target_images = []
-    for path in images:
-        image = cv2.imread(str(path))
-        if image is None:
-            raise RuntimeError(f"Could not read reconstructed frame: {path}")
-        target_images.append(
-            torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).float() / 255.0
-        )
-
-
-    target_all = torch.stack(target_images).to(device)
+    target_all = _load_targets_parallel(images)  
 
     means = data["means"].to(device).requires_grad_()
     colors_init = data["colors"].numpy()
@@ -223,7 +288,7 @@ def train_splats(
     Ks_all = data["Ks"].to(device)
     num_views = target_all.shape[0]
     optimizer = torch.optim.Adam([
-        {"params": [means], "lr": 1.6e-4, "name": "means"},
+        {"params": [means], "lr": means_lr_init, "name": "means"},
         {"params": [colors], "lr": 2.5e-3, "name": "colors"},
         {"params": [scales], "lr": 5e-3, "name": "scales"},
         {"params": [quats], "lr": 1e-3, "name": "quats"},
@@ -237,6 +302,8 @@ def train_splats(
             means.detach(), voxel_config or VoxelGuidedConfig(), device
         )
 
+    use_amp = mixed_precision and device == "cuda"
+
     perm = torch.randperm(num_views, device=device)
     cursor = 0
     for step in range(steps):
@@ -246,19 +313,35 @@ def train_splats(
         idx = perm[cursor : cursor + view_batch_size]
         cursor += view_batch_size
 
-        target = target_all[idx]
+        
+        
+        target = target_all[idx.cpu()].to(device, non_blocking=True).float() / 255.0
         viewmats = viewmats_all[idx]
         Ks = Ks_all[idx]
+
+        
+        
+        for group in optimizer.param_groups:
+            if group["name"] == "means":
+                group["lr"] = _means_lr(step, steps, means_lr_init, means_lr_final_ratio)
 
         optimizer.zero_grad(set_to_none=True)
         quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         scales_c = scales.clamp(max=max_log_scale)
 
-        rendered, _, _ = rasterization(
-            means, quats_n, scales_c.exp(), opacities.sigmoid(), colors.sigmoid(),
-            viewmats, Ks, width, height, packed=True,
-        )
-        loss = torch.abs(rendered - target).mean()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            rendered, _, _ = rasterization(
+                means, quats_n, scales_c.exp(), opacities.sigmoid(), colors.sigmoid(),
+                viewmats, Ks, width, height, packed=True,
+            )
+            l1 = torch.abs(rendered - target).mean()
+            if ssim_weight > 0:
+                rendered_nchw = rendered.permute(0, 3, 1, 2).float()
+                target_nchw = target.permute(0, 3, 1, 2).float()
+                ssim_val = _ssim(rendered_nchw, target_nchw)
+                loss = (1 - ssim_weight) * l1 + ssim_weight * (1 - ssim_val)
+            else:
+                loss = l1
         loss.backward()
 
         if voxel_opt is not None:
@@ -271,6 +354,14 @@ def train_splats(
             means, colors, scales, quats, opacities = voxel_opt.maybe_densify_and_prune(
                 step, optimizer, means, colors, scales, quats, opacities,
             )
+
+        if (
+            opacity_reset_interval
+            and step > 0
+            and step % opacity_reset_interval == 0
+            and step < steps - 1
+        ):
+            _reset_opacities(opacities, optimizer)
 
     with torch.no_grad():
             quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
@@ -306,14 +397,22 @@ def build_model(
     vocab_tree: Path | None = None,
     voxel_guided: bool = True,
     voxel_config: VoxelGuidedConfig | None = None,
+    means_lr_init: float = 1.6e-4,
+    means_lr_final_ratio: float = 0.01,
+    ssim_weight: float = 0.2,
+    opacity_reset_interval: int = 3000,
+    mixed_precision: bool = True,
+    colmap_gpu: bool = True,
 ) -> Path:
     capture_dir = output / "capture"
-    capture = extract_frames(video, capture_dir, every, max_width)
-    undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
+    extract_frames(video, capture_dir, every, max_width)
+    undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree, colmap_gpu)
     data, images, width, height = load_reconstruction(undistorted, max_points)
     result = train_splats(
         data, images, width, height, steps, device, view_batch_size,
         voxel_guided, voxel_config,
+        means_lr_init, means_lr_final_ratio, ssim_weight,
+        opacity_reset_interval, mixed_precision,
     )
     glb_path = output / "model.glb"
     print("Exporting model...")
@@ -360,6 +459,30 @@ def main() -> None:
         "--voxel-gamma3", type=float, default=0.075,
         help="Voxels whose average opacity falls below this are pruned.",
     )
+    parser.add_argument(
+        "--means-lr", type=float, default=1.6e-4,
+        help="Initial learning rate for Gaussian positions.",
+    )
+    parser.add_argument(
+        "--means-lr-final-ratio", type=float, default=0.01,
+        help="Means LR is annealed exponentially to (means-lr * this ratio) by the last step.",
+    )
+    parser.add_argument(
+        "--ssim-weight", type=float, default=0.2,
+        help="Loss = (1 - w) * L1 + w * (1 - SSIM). Set to 0 to use pure L1.",
+    )
+    parser.add_argument(
+        "--opacity-reset-interval", type=int, default=3000,
+        help="Reset all opacities every N steps to flush unearned floaters. 0 disables.",
+    )
+    parser.add_argument(
+        "--no-mixed-precision", dest="mixed_precision", action="store_false",
+        help="Disable bf16 autocast during rasterization/loss (CUDA only).",
+    )
+    parser.add_argument(
+        "--no-colmap-gpu", dest="colmap_gpu", action="store_false",
+        help="Force COLMAP SIFT extraction/matching onto CPU.",
+    )
     args = parser.parse_args()
     voxel_config = VoxelGuidedConfig(
         n_along_shortest=args.voxel_n,
@@ -381,6 +504,12 @@ def main() -> None:
             args.vocab_tree,
             args.voxel_guided,
             voxel_config,
+            args.means_lr,
+            args.means_lr_final_ratio,
+            args.ssim_weight,
+            args.opacity_reset_interval,
+            args.mixed_precision,
+            args.colmap_gpu,
         )
     )
 
