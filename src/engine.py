@@ -13,6 +13,7 @@ import torch
 from gsplat import rasterization
 from src.gsplat_viewer import start_viewer
 from src.gltf_gsplat import write_gsplat_glb
+from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
 
 def extract_frames(video: Path, output: Path, every: int, max_width: int):
     if every < 1:
@@ -72,7 +73,7 @@ def run_colmap(capture: Path, workdir: Path, vocab_tree: Path | None) -> Path:
     match_command = [
         "colmap", "sequential_matcher",
         "--database_path", str(database),
-        "--SequentialMatching.overlap", "15",
+        "--SequentialMatching.overlap", "30",
     ]
     if vocab_tree is not None:
         match_command += [
@@ -82,7 +83,12 @@ def run_colmap(capture: Path, workdir: Path, vocab_tree: Path | None) -> Path:
     _run(match_command)
 
     _run([
-        "colmap", "mapper",
+        "colmap", "view_graph_calibrator",
+        "--database_path", str(database),
+    ])
+
+    _run([
+        "colmap", "global_mapper",
         "--database_path", str(database),
         "--image_path", str(capture),
         "--output_path", str(sparse),
@@ -170,12 +176,14 @@ def train_splats(
     steps: int,
     device: str,
     view_batch_size: int,
+    voxel_guided: bool = True,
+    voxel_config: VoxelGuidedConfig | None = None,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "gsplat training requres CUDA"
+            "gsplat training requires CUDA"
         )
 
     target_images = []
@@ -215,17 +223,23 @@ def train_splats(
     Ks_all = data["Ks"].to(device)
     num_views = target_all.shape[0]
     optimizer = torch.optim.Adam([
-        {"params": [means], "lr": 1.6e-4},
-        {"params": [colors], "lr": 2.5e-3},
-        {"params": [scales], "lr": 5e-3},
-        {"params": [quats], "lr": 1e-3},
-        {"params": [opacities], "lr": 5e-2},
+        {"params": [means], "lr": 1.6e-4, "name": "means"},
+        {"params": [colors], "lr": 2.5e-3, "name": "colors"},
+        {"params": [scales], "lr": 5e-3, "name": "scales"},
+        {"params": [quats], "lr": 1e-3, "name": "quats"},
+        {"params": [opacities], "lr": 5e-2, "name": "opacities"},
     ])
     max_log_scale = float(np.log(mean_nn_dist.max() * 20))
 
+    voxel_opt = None
+    if voxel_guided:
+        voxel_opt = VoxelGuidedOptimizer(
+            means.detach(), voxel_config or VoxelGuidedConfig(), device
+        )
+
     perm = torch.randperm(num_views, device=device)
     cursor = 0
-    for _ in range(steps):
+    for step in range(steps):
         if cursor + view_batch_size > num_views:
             perm = torch.randperm(num_views, device=device)
             cursor = 0
@@ -246,7 +260,17 @@ def train_splats(
         )
         loss = torch.abs(rendered - target).mean()
         loss.backward()
+
+        if voxel_opt is not None:
+            voxel_opt.accumulate_step(means)
+            voxel_opt.dampen_gradients(means, scales, colors, quats, opacities)
+
         optimizer.step()
+
+        if voxel_opt is not None:
+            means, colors, scales, quats, opacities = voxel_opt.maybe_densify_and_prune(
+                step, optimizer, means, colors, scales, quats, opacities,
+            )
 
     with torch.no_grad():
             quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
@@ -275,17 +299,22 @@ def build_model(
     output: Path,
     every: int = 5,
     max_width: int = 1920,
-    steps: int = 2000,
+    steps: int = 5000,
     device: str = "cuda",
-    view_batch_size: int = 2,
-    max_points: int = 200_000,
+    view_batch_size: int = 4,
+    max_points: int = 150_000,
     vocab_tree: Path | None = None,
+    voxel_guided: bool = True,
+    voxel_config: VoxelGuidedConfig | None = None,
 ) -> Path:
     capture_dir = output / "capture"
-    extract_frames(video, capture_dir, every, max_width)
+    capture = extract_frames(video, capture_dir, every, max_width)
     undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
     data, images, width, height = load_reconstruction(undistorted, max_points)
-    result = train_splats(data, images, width, height, steps, device, view_batch_size)
+    result = train_splats(
+        data, images, width, height, steps, device, view_batch_size,
+        voxel_guided, voxel_config,
+    )
     glb_path = output / "model.glb"
     print("Exporting model...")
     export_gltf(result, glb_path)
@@ -306,7 +335,39 @@ def main() -> None:
     parser.add_argument("--view-batch-size", type=int, default=4)
     parser.add_argument("--max-points", type=int, default=100_000)
     parser.add_argument("--vocab-tree", type=Path, default=None)
+    parser.add_argument(
+        "--no-voxel-guided", dest="voxel_guided", action="store_false",
+        help="Disable the DroneSplat-style voxel-guided optimization (floater fix).",
+    )
+    parser.add_argument(
+        "--voxel-n", type=int, default=80,
+        help="Divide the scene's shortest bbox edge into this many voxels (paper's N).",
+    )
+    parser.add_argument(
+        "--voxel-tau", type=float, default=3.5,
+        help="Voxel-lengths a Gaussian may drift/scale before being flagged unconstrained.",
+    )
+    parser.add_argument(
+        "--voxel-gamma1", type=float, default=1e-4,
+        help="Accumulated world-space gradient norm needed to grow into an empty voxel "
+             "(scene-dependent - see src/voxel_guided.py's module docstring).",
+    )
+    parser.add_argument(
+        "--voxel-gamma2", type=int, default=2,
+        help="Voxels with fewer live Gaussians than this are pruned.",
+    )
+    parser.add_argument(
+        "--voxel-gamma3", type=float, default=0.075,
+        help="Voxels whose average opacity falls below this are pruned.",
+    )
     args = parser.parse_args()
+    voxel_config = VoxelGuidedConfig(
+        n_along_shortest=args.voxel_n,
+        tau=args.voxel_tau,
+        gamma1=args.voxel_gamma1,
+        gamma2=args.voxel_gamma2,
+        gamma3=args.voxel_gamma3,
+    )
     print(
         build_model(
             args.video,
@@ -318,6 +379,8 @@ def main() -> None:
             args.view_batch_size,
             args.max_points,
             args.vocab_tree,
+            args.voxel_guided,
+            voxel_config,
         )
     )
 
