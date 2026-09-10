@@ -49,7 +49,6 @@ def write_gsplat_glb(
     norm = np.clip(np.linalg.norm(quats_xyzw, axis=1, keepdims=True), 1e-8, None)
     quats_xyzw = quats_xyzw / norm
 
-    sh0 = (colors - 0.5) / SH_C0
 
     if color_space == "srgb_rec709_display":
         color0_rgb = _srgb_to_linear(colors)
@@ -57,6 +56,7 @@ def write_gsplat_glb(
         color0_rgb = colors
     else:
         raise ValueError(f"Unsupported color_space: {color_space}")
+    sh0 = (color0_rgb - 0.5) / SH_C0
     color0 = np.concatenate([color0_rgb, opacities[:, None]], axis=1).astype(np.float32)
 
 

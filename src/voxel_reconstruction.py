@@ -17,6 +17,7 @@ class VoxelGuidedConfig:
     warmup_iters: int = 500
     densify_interval: int = 100
     prune_interval: int = 100
+    max_gaussians: int = 300_000
 
 
 
@@ -126,6 +127,10 @@ class VoxelGuidedOptimizer:
 
     def _densify(self, optimizer, params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         means = params["means"]
+        if means.shape[0] >= self.cfg.max_gaussians:
+            self.grad_accum.zero_()
+            self.grad_count.zero_()
+            return params
         with torch.no_grad():
             avg_grad = self.grad_accum / self.grad_count.clamp_min(1).unsqueeze(-1)
             avg_grad_norm = avg_grad.norm(dim=-1)
@@ -142,11 +147,7 @@ class VoxelGuidedOptimizer:
                 target_ijk = ijk[candidates] + direction.to(torch.int64)
                 target_flat = _flatten_ijk(target_ijk, self.cfg._base)
 
-                occupied = set(self.voxel_id.tolist())
-                empty_mask = torch.tensor(
-                    [int(v.item()) not in occupied for v in target_flat],
-                    device=means.device, dtype=torch.bool,
-                )
+                empty_mask = ~torch.isin(target_flat, self.voxel_id)
                 grow_idx = candidates.nonzero(as_tuple=True)[0][empty_mask]
                 grow_target_flat = target_flat[empty_mask]
 
