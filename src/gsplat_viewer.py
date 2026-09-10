@@ -7,6 +7,40 @@ import numpy as np
 import torch
 from gsplat import rasterization
 import argparse
+from threading import Lock
+
+
+class TrainingPreview:
+    """One pending CPU snapshot, shared by training and the GUI thread."""
+
+    def __init__(self):
+        self.lock = Lock()
+        self.data = None
+        self.status = "Training: 0.0% - preparing images and splats"
+        self.error = None
+        self.closed = False
+
+    def publish(self, data, completed, total):
+        with self.lock:
+            if not self.closed:
+                self.data = data
+                self.status = f"Training: {100 * completed / total:.1f}% ({completed}/{total})"
+
+    def read(self):
+        with self.lock:
+            data, self.data = self.data, None
+            return data, self.status, self.error
+
+    def finish(self, error=None):
+        with self.lock:
+            self.error = error
+            if error is None:
+                self.status = "Training: 100.0% - model saved"
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            self.data = None
 
 from src.gltf_gsplat import read_gsplat_glb
 
@@ -105,30 +139,19 @@ def _draw_help(frame_bgr: np.ndarray) -> np.ndarray:
 
 
 def start_viewer(
-    glb: Path | str,
+    glb: Path | str | None,
     width: int = 1920,
     height: int = 1080,
     fov: float = 60.0,
     interactive_scale: float = 0.5,
+    preview: TrainingPreview | None = None,
 ) -> None:
-    glb = Path(glb)
-
     if not torch.cuda.is_available():
         raise RuntimeError("This viewer needs a CUDA GPU (gsplat's rasterizer is CUDA-only).")
     device = "cuda"
     torch.backends.cudnn.benchmark = True
-
-    data = read_gsplat_glb(glb)
-    means = data["means"].to(device)
-    quats = data["quats"].to(device)
-    scales = data["scales"].to(device)
-    opacities = data["opacities"].to(device)
-    colors = data["colors"].to(device)
-
-    means_np = data["means"].numpy()
-    target = means_np.mean(axis=0)
-    radius = float(np.linalg.norm(means_np - target, axis=1).max()) * 1.5 or 1.0
-    cam = OrbitCamera(target, radius)
+    data = read_gsplat_glb(Path(glb)) if preview is None else None
+    cam = None
 
     interactive_scale = min(max(interactive_scale, 0.1), 1.0)
     render_w, render_h = width, height
@@ -153,6 +176,8 @@ def start_viewer(
     state = {"dragging": None, "last": (0, 0), "show_help": True}
 
     def on_mouse(event, x, y, flags, _param):
+        if cam is None:
+            return
         if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MBUTTONDOWN):
             state["dragging"] = "orbit" if event == cv2.EVENT_LBUTTONDOWN else "pan"
             state["last"] = (x, y)
@@ -173,33 +198,69 @@ def start_viewer(
 
     cv2.setMouseCallback(window, on_mouse)
 
+    cached_view = None
+    cached_size = None
+    cached_status = None
+    cached_help = None
+    frame_bgr = np.zeros((height, width, 3), dtype=np.uint8)
     while True:
+        status = ""
+        updated = data is not None
+        if preview is not None:
+            data, status, error = preview.read()
+            if error is not None:
+                cv2.destroyWindow(window)
+                raise error
+            updated = data is not None
+        if updated:
+            means = data["means"].to(device)
+            quats = data["quats"].to(device)
+            scales = data["scales"].to(device)
+            opacities = data["opacities"].to(device)
+            colors = data["colors"].to(device)
+            if cam is None and len(data["means"]):
+                means_np = data["means"].numpy()
+                target = means_np.mean(axis=0)
+                radius = float(np.linalg.norm(means_np - target, axis=1).max()) * 1.5 or 1.0
+                cam = OrbitCamera(target, radius)
+            data = None
+
         fast = state["dragging"] is not None and interactive_scale < 1.0
         render_w, render_h = (fast_w, fast_h) if fast else (width, height)
         K_t = K_fast if fast else K_full
+        view = cam.viewmat() if cam is not None else None
+        size = (render_w, render_h)
+        redraw = updated or cached_size != size or not np.array_equal(view, cached_view)
+        if redraw and cam is not None:
+            viewmat = torch.from_numpy(view).to(device).unsqueeze(0)
+            with torch.inference_mode():
+                if means.shape[0]:
+                    rendered, _, _ = rasterization(
+                        means, quats, scales, opacities, colors,
+                        viewmat, K_t, render_w, render_h, packed=True,
+                    )
+                    frame = rendered[0].clamp(0, 1).mul(255).to(torch.uint8)[..., [2, 1, 0]]
+                    frame_bgr = frame.contiguous().cpu().numpy()
+                else:
+                    frame_bgr = np.zeros((render_h, render_w, 3), dtype=np.uint8)
+            if fast:
+                frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
+            cached_view = view.copy()
+        cached_size = size
+        if redraw or status != cached_status or state["show_help"] != cached_help:
+            display = _draw_help(frame_bgr) if state["show_help"] else frame_bgr.copy()
+            if status:
+                cv2.rectangle(display, (0, height - 36), (width, height), (0, 0, 0), -1)
+                cv2.putText(display, status, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.imshow(window, display)
+            cached_status, cached_help = status, state["show_help"]
 
-        viewmat = torch.from_numpy(cam.viewmat()).to(device).unsqueeze(0)
-        with torch.inference_mode():
-            rendered, _, _ = rasterization(
-                means, quats, scales, opacities, colors,
-                viewmat, K_t, render_w, render_h, packed=True,
-            )
-
-
-
-
-            frame_bgr_gpu = rendered[0].clamp(0, 1).mul(255.0).to(torch.uint8)[..., [2, 1, 0]]
-        frame_bgr = frame_bgr_gpu.contiguous().cpu().numpy()
-
-        if fast:
-            frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
-        if state["show_help"]:
-            frame_bgr = _draw_help(frame_bgr)
-        cv2.imshow(window, frame_bgr)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):
+        key = cv2.waitKey(16) & 0xFF
+        if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
             break
+        if cam is None:
+            continue
         elif key in (ord("+"), ord("]")):
             cam.radius *= 0.9
         elif key in (ord("-"), ord("[")):
@@ -217,7 +278,9 @@ def start_viewer(
         elif key == ord("h"):
             state["show_help"] = not state["show_help"]
 
-    cv2.destroyAllWindows()
+    if preview is not None:
+        preview.close()
+    cv2.destroyWindow(window)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 
 import os
 import cv2
@@ -14,7 +15,7 @@ import pycolmap
 import torch
 import torch.nn.functional as F
 from gsplat import rasterization
-from src.gsplat_viewer import start_viewer
+from src.gsplat_viewer import TrainingPreview, start_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
 
@@ -278,6 +279,7 @@ def train_splats(
     means_lr_final_ratio: float = 0.01,
     opacity_reset_interval: int = 3000,
     mixed_precision: bool = True,
+    preview: TrainingPreview | None = None,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -298,7 +300,7 @@ def train_splats(
 
     from scipy.spatial import cKDTree
 
-    means_np = data["means"].numpy()
+    means_np = data["means"].detach().cpu().numpy()
     tree = cKDTree(means_np)
     dists, _ = tree.query(means_np, k=4)
     mean_nn_dist = np.clip(dists[:, 1:].mean(axis=1), 1e-6, None)
@@ -330,6 +332,33 @@ def train_splats(
         )
 
     use_amp = mixed_precision and device == "cuda"
+
+    last_preview = 0.0
+    last_percent = -1
+
+    def report(completed: int) -> None:
+        nonlocal last_preview, last_percent
+        percent = int(100 * completed / steps)
+        if percent != last_percent:
+            print(f"\rTraining splats: {100 * completed / steps:5.1f}% ({completed}/{steps})",
+                  end="\n" if completed == steps else "", flush=True)
+            last_percent = percent
+        now = monotonic()
+        if preview is not None and not preview.closed and (
+            completed == 0 or completed == steps or now - last_preview >= 1.0
+        ):
+            with torch.no_grad():
+                snapshot = {
+                    "means": means.detach().cpu().clone(),
+                    "colors": colors.detach().sigmoid().cpu(),
+                    "scales": scales.detach().clamp(max=max_log_scale).exp().cpu(),
+                    "quats": F.normalize(quats.detach(), dim=-1, eps=1e-8).cpu(),
+                    "opacities": opacities.detach().sigmoid().cpu(),
+                }
+            preview.publish(snapshot, completed, steps)
+            last_preview = now
+
+    report(0)
 
     perm = torch.randperm(num_views, device=device)
     cursor = 0
@@ -379,6 +408,8 @@ def train_splats(
         ):
             _reset_opacities(opacities, optimizer)
 
+        report(step + 1)
+
     with torch.no_grad():
         quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
         scales.copy_(scales.clamp(max=max_log_scale))
@@ -427,16 +458,32 @@ def build_model(
     print("Loading reconstructions...")
     data, images, width, height = load_reconstruction(undistorted, max_points)
     print("Training splats...")
-    result = train_splats(
-        data, images, width, height, steps, device, view_batch_size,
-        voxel_guided, voxel_config,
-        means_lr_init, means_lr_final_ratio,
-        opacity_reset_interval, mixed_precision,
-    )
     glb_path = output / "model.glb"
-    print("Exporting model...")
-    export_gltf(result, glb_path)
-    start_viewer(glb_path, width, height)
+    preview = TrainingPreview()
+
+    def train_and_export():
+        try:
+            result = train_splats(
+                data, images, width, height, steps, device, view_batch_size,
+                voxel_guided, voxel_config,
+                means_lr_init, means_lr_final_ratio,
+                opacity_reset_interval, mixed_precision, preview=preview,
+            )
+            print("Exporting model...")
+            export_gltf(result, glb_path)
+        except Exception as exc:
+            preview.finish(exc)
+            raise
+        else:
+            preview.finish()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        training = pool.submit(train_and_export)
+        try:
+            start_viewer(None, width, height, preview=preview)
+        finally:
+            preview.close()
+        training.result()
     return glb_path
 
 
