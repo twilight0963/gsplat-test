@@ -18,6 +18,9 @@ class VoxelGuidedConfig:
     densify_interval: int = 100
     prune_interval: int = 100
     max_gaussians: int = 300_000
+    prune_opacity: float = 0.005
+    max_axis_ratio: float = 10.0
+    scale_regularization: float = 0.01
 
 
 
@@ -53,6 +56,12 @@ class VoxelGuidedOptimizer:
         n = init_means.shape[0]
         self.grad_accum = torch.zeros((n, 3), device=device)
         self.grad_count = torch.zeros(n, device=device)
+        self.refine_after = 0
+
+    def pause_after_reset(self, step: int, recovery_steps: int) -> None:
+        self.refine_after = step + recovery_steps
+        self.grad_accum.zero_()
+        self.grad_count.zero_()
 
 
 
@@ -87,7 +96,9 @@ class VoxelGuidedOptimizer:
             decay = torch.exp(-self.cfg.decay_rate * excess / self.voxel_size)
             unconstrained = excess > 0
 
-        for tensor in (means, scales, colors, quats, opacities):
+        # Allow scales to shrink and opacities to recover or fade even when drift
+        # damping is almost zero. Freezing those gradients locks in floaters.
+        for tensor in (means, colors, quats):
             if tensor.grad is not None:
                 view_shape = (-1,) + (1,) * (tensor.grad.dim() - 1)
                 tensor.grad.mul_(decay.view(*view_shape))
@@ -117,6 +128,9 @@ class VoxelGuidedOptimizer:
     ):
         params = {"means": means, "colors": colors, "scales": scales, "quats": quats, "opacities": opacities}
 
+        if step < self.refine_after:
+            return tuple(params[name] for name in self.PARAM_NAMES)
+
         if step >= self.cfg.warmup_iters and step % self.cfg.densify_interval == 0:
             params = self._densify(optimizer, params)
 
@@ -125,6 +139,7 @@ class VoxelGuidedOptimizer:
 
         return tuple(params[name] for name in self.PARAM_NAMES)
 
+    @torch.no_grad()
     def _densify(self, optimizer, params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         means = params["means"]
         if means.shape[0] >= self.cfg.max_gaussians:
@@ -154,6 +169,11 @@ class VoxelGuidedOptimizer:
             else:
                 grow_idx = means.new_zeros((0,), dtype=torch.long)
                 grow_target_flat = means.new_zeros((0,), dtype=torch.long)
+
+        capacity = self.cfg.max_gaussians - means.shape[0]
+        if grow_idx.numel() > capacity:
+            selected = torch.topk(avg_grad_norm[grow_idx], capacity).indices
+            grow_idx, grow_target_flat = grow_idx[selected], grow_target_flat[selected]
 
         if grow_idx.numel() > 0:
             new_means = self._voxel_center(self._ijk_from_flat(grow_target_flat))
@@ -187,8 +207,16 @@ class VoxelGuidedOptimizer:
             opac_sum = torch.zeros_like(unique_ids, dtype=torch.float32).index_add_(0, inverse, opac)
             avg_opacity = opac_sum / counts.clamp_min(1)
 
-            voxel_ok = (counts >= self.cfg.gamma2) & (avg_opacity >= self.cfg.gamma3)
-            keep = voxel_ok[inverse]
+            # Sparse occupancy alone is not evidence of bad geometry. Preserve
+            # opaque singleton voxels, but remove individual near-invisible GSs
+            # even when their voxel contains many opaque neighbors.
+            weak_voxel = (counts < self.cfg.gamma2) & (avg_opacity < self.cfg.gamma3)
+            keep = ~weak_voxel[inverse] & (opac >= self.cfg.prune_opacity)
+
+        if not keep.any():
+            # Do not silently erase the entire reconstruction after a reset or
+            # on a poorly constrained input. Let optimization recover first.
+            return params
 
         if keep.all():
             return params
@@ -224,7 +252,7 @@ def _extend_optimizer(optimizer, params, additions, names):
         addition = additions[name]
 
         stored = optimizer.state.get(old_tensor, None)
-        new_tensor = torch.cat([old_tensor.detach(), addition], dim=0).requires_grad_(True)
+        new_tensor = torch.cat([old_tensor.detach(), addition.detach()], dim=0).requires_grad_(True)
         if stored is not None:
             stored["exp_avg"] = torch.cat([stored["exp_avg"], torch.zeros_like(addition)], dim=0)
             stored["exp_avg_sq"] = torch.cat([stored["exp_avg_sq"], torch.zeros_like(addition)], dim=0)

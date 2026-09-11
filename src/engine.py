@@ -247,6 +247,12 @@ def _means_lr(step: int, steps: int, lr_init: float, lr_final_ratio: float) -> f
     return lr_init * (lr_final_ratio ** t)
 
 
+def _scale_regularizer(log_scales: torch.Tensor, max_ratio: float) -> torch.Tensor:
+    """Soft anisotropy penalty; no hard deletion of thin surfaces."""
+    spread = log_scales.amax(dim=-1) - log_scales.amin(dim=-1)
+    return (spread.exp() - max_ratio).clamp_min(0).mean()
+
+
 def _reset_opacities(
     opacities: torch.Tensor, optimizer: torch.optim.Optimizer, value: float = 0.01
 ) -> None:
@@ -255,7 +261,7 @@ def _reset_opacities(
 
     inv_sigmoid = float(np.log(value / (1 - value)))
     with torch.no_grad():
-        opacities.data.fill_(inv_sigmoid)
+        opacities.clamp_(max=inv_sigmoid)
         for group in optimizer.param_groups:
             if group.get("name") == "opacities":
                 for p in group["params"]:
@@ -283,6 +289,11 @@ def train_splats(
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
+    if view_batch_size < 1:
+        raise ValueError("--view-batch-size must be at least 1")
+    quality_config = voxel_config or VoxelGuidedConfig()
+    if quality_config.max_axis_ratio < 1 or quality_config.scale_regularization < 0:
+        raise ValueError("Scale ratio must be >= 1 and regularization must be >= 0")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "gsplat training requires CUDA"
@@ -302,7 +313,9 @@ def train_splats(
 
     means_np = data["means"].detach().cpu().numpy()
     tree = cKDTree(means_np)
-    dists, _ = tree.query(means_np, k=4)
+    if len(means_np) < 2:
+        raise ValueError("At least two reconstructed points are required")
+    dists, _ = tree.query(means_np, k=min(4, len(means_np)))
     mean_nn_dist = np.clip(dists[:, 1:].mean(axis=1), 1e-6, None)
     init_scale = np.log(mean_nn_dist).astype(np.float32)
     scales = torch.from_numpy(init_scale).to(device).unsqueeze(-1).repeat(1, 3)
@@ -323,12 +336,13 @@ def train_splats(
         {"params": [quats], "lr": 1e-3, "name": "quats"},
         {"params": [opacities], "lr": 5e-2, "name": "opacities"},
     ])
-    max_log_scale = float(np.log(mean_nn_dist.max() * 20))
+    # An isolated SfM outlier must not set the scale ceiling for the whole scene.
+    max_log_scale = float(np.log(np.quantile(mean_nn_dist, 0.95) * 20))
 
     voxel_opt = None
     if voxel_guided:
         voxel_opt = VoxelGuidedOptimizer(
-            means.detach(), voxel_config or VoxelGuidedConfig(), device
+            means.detach(), quality_config, device
         )
 
     use_amp = mixed_precision and device == "cuda"
@@ -360,10 +374,11 @@ def train_splats(
 
     report(0)
 
+    recovery_steps = max(quality_config.prune_interval, (num_views + view_batch_size - 1) // view_batch_size)
     perm = torch.randperm(num_views, device=device)
     cursor = 0
     for step in range(steps):
-        if cursor + view_batch_size > num_views:
+        if cursor >= num_views:
             perm = torch.randperm(num_views, device=device)
             cursor = 0
         idx = perm[cursor : cursor + view_batch_size]
@@ -387,6 +402,10 @@ def train_splats(
                 viewmats, Ks, width, height, packed=True,
             )
             loss = torch.abs(rendered - target).mean()
+        if quality_config.scale_regularization:
+            loss = loss + quality_config.scale_regularization * _scale_regularizer(
+                scales, quality_config.max_axis_ratio
+            )
         loss.backward()
 
         if voxel_opt is not None:
@@ -404,9 +423,11 @@ def train_splats(
             opacity_reset_interval
             and step > 0
             and step % opacity_reset_interval == 0
-            and step < steps - 1
+            and step + recovery_steps < steps - 1
         ):
             _reset_opacities(opacities, optimizer)
+            if voxel_opt is not None:
+                voxel_opt.pause_after_reset(step, recovery_steps)
 
         report(step + 1)
 
@@ -471,6 +492,7 @@ def build_model(
             )
             print("Exporting model...")
             export_gltf(result, glb_path)
+            print("Finished export.")
         except Exception as exc:
             preview.finish(exc)
             raise
@@ -500,6 +522,10 @@ def main() -> None:
     parser.add_argument("--view-batch-size", type=int, default=4)
     parser.add_argument("--max-points", type=int, default=200_000)
     parser.add_argument("--max-gaussians", type=int, default=200_000)
+    parser.add_argument("--max-axis-ratio", type=float, default=10.0,
+                        help="Axis ratio above which splats receive a soft shape penalty.")
+    parser.add_argument("--scale-regularization", type=float, default=0.01,
+                        help="Strength of the anti-streak shape penalty; 0 disables it.")
     parser.add_argument("--vocab-tree", type=Path, default=None)
     parser.add_argument(
         "--no-voxel-guided", dest="voxel_guided", action="store_false",
@@ -520,11 +546,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--voxel-gamma2", type=int, default=2,
-        help="Voxels with fewer live Gaussians than this are pruned.",
+        help="Prune sparse voxels only when their average opacity is also below voxel-gamma3.",
     )
     parser.add_argument(
         "--voxel-gamma3", type=float, default=0.075,
-        help="Voxels whose average opacity falls below this are pruned.",
+        help="Average opacity threshold for pruning sparse voxels.",
     )
     parser.add_argument(
         "--means-lr", type=float, default=1.6e-4,
@@ -559,6 +585,8 @@ def main() -> None:
         gamma2=args.voxel_gamma2,
         gamma3=args.voxel_gamma3,
         max_gaussians=args.max_gaussians,
+        max_axis_ratio=args.max_axis_ratio,
+        scale_regularization=args.scale_regularization,
     )
     print(
         build_model(
@@ -580,7 +608,8 @@ def main() -> None:
             args.brightness,
             args.contrast,
             args.sharpness
-        )
+        ),
+        flush=True
     )
 
 

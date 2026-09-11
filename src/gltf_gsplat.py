@@ -24,6 +24,11 @@ def _srgb_to_linear(c: np.ndarray) -> np.ndarray:
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4).astype(np.float32)
 
 
+def _linear_to_srgb(c: np.ndarray) -> np.ndarray:
+    c = np.clip(c, 0.0, 1.0)
+    return np.where(c <= 0.0031308, 12.92 * c, 1.055 * c ** (1.0 / 2.4) - 0.055).astype(np.float32)
+
+
 def _pad(buf: bytes, pad_byte: bytes) -> bytes:
     remainder = len(buf) % 4
     return buf if remainder == 0 else buf + pad_byte * (4 - remainder)
@@ -199,6 +204,13 @@ def read_gsplat_glb(path: Path) -> dict[str, torch.Tensor]:
     quats_wxyz = quats_wxyz / norm
 
     colors = np.clip(SH_C0 * sh0 + 0.5, 0.0, 1.0).astype(np.float32)
+    # Undo this writer's conversion so the viewer receives the same per-splat
+    # colors as the live training preview (before alpha compositing).
+    color_space = primitive.get("extensions", {}).get("KHR_gaussian_splatting", {}).get("colorSpace")
+    if color_space == "srgb_rec709_display":
+        colors = _linear_to_srgb(colors)
+    elif color_space != "lin_rec709_display":
+        raise ValueError(f"Unsupported or missing color_space: {color_space}")
     opacities = np.clip(opacities, 0.0, 1.0).astype(np.float32)
     scales = np.clip(scales, 0.0, None).astype(np.float32)
 
