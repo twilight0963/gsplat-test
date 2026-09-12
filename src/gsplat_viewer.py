@@ -8,6 +8,9 @@ import torch
 from gsplat import rasterization
 import argparse
 from threading import Lock
+from queue import Empty
+from time import sleep
+from src.viewer_http import ViewerHTTP
 
 
 class TrainingPreview:
@@ -145,6 +148,9 @@ def start_viewer(
     fov: float = 60.0,
     interactive_scale: float = 0.5,
     preview: TrainingPreview | None = None,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    desktop: bool = False,
 ) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This viewer needs a CUDA GPU (gsplat's rasterizer is CUDA-only).")
@@ -161,19 +167,14 @@ def start_viewer(
     K_fast = torch.from_numpy(make_K(fast_w, fast_h, fov)).to(device).unsqueeze(0)
 
     window = "gsplat viewer"
-    try:
-
-
-
-
-
-
-        cv2.namedWindow(window, cv2.WINDOW_OPENGL | cv2.WINDOW_NORMAL)
-    except cv2.error:
+    web = None
+    if desktop:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, width, height)
+        cv2.resizeWindow(window, width, height)
+    else:
+        web = ViewerHTTP(host, port)
 
-    state = {"dragging": None, "last": (0, 0), "show_help": True}
+    state = {"dragging": None, "last": (0, 0), "show_help": desktop}
 
     def on_mouse(event, x, y, flags, _param):
         if cam is None:
@@ -196,91 +197,128 @@ def start_viewer(
             delta = 1 if flags > 0 else -1
             cam.radius = max(cam.radius * (0.9 ** delta), 1e-3)
 
-    cv2.setMouseCallback(window, on_mouse)
+    if desktop:
+        cv2.setMouseCallback(window, on_mouse)
 
     cached_view = None
     cached_size = None
     cached_status = None
     cached_help = None
     frame_bgr = np.zeros((height, width, 3), dtype=np.uint8)
-    while True:
-        status = ""
-        updated = data is not None
-        if preview is not None:
-            data, status, error = preview.read()
-            if error is not None:
-                cv2.destroyWindow(window)
-                raise error
+    try:
+        while True:
+            status = ""
             updated = data is not None
-        if updated:
-            means = data["means"].to(device)
-            quats = data["quats"].to(device)
-            scales = data["scales"].to(device)
-            opacities = data["opacities"].to(device)
-            colors = data["colors"].to(device)
-            if cam is None and len(data["means"]):
-                means_np = data["means"].numpy()
-                target = means_np.mean(axis=0)
-                radius = float(np.linalg.norm(means_np - target, axis=1).max()) * 1.5 or 1.0
-                cam = OrbitCamera(target, radius)
-            data = None
+            if preview is not None:
+                data, status, error = preview.read()
+                if error is not None:
+                    raise error
+                updated = data is not None
+            if updated:
+                means = data["means"].to(device)
+                quats = data["quats"].to(device)
+                scales = data["scales"].to(device)
+                opacities = data["opacities"].to(device)
+                colors = data["colors"].to(device)
+                if cam is None and len(data["means"]):
+                    means_np = data["means"].numpy()
+                    target = means_np.mean(axis=0)
+                    radius = float(np.linalg.norm(means_np - target, axis=1).max()) * 1.5 or 1.0
+                    cam = OrbitCamera(target, radius)
+                data = None
 
-        fast = state["dragging"] is not None and interactive_scale < 1.0
-        render_w, render_h = (fast_w, fast_h) if fast else (width, height)
-        K_t = K_fast if fast else K_full
-        view = cam.viewmat() if cam is not None else None
-        size = (render_w, render_h)
-        redraw = updated or cached_size != size or not np.array_equal(view, cached_view)
-        if redraw and cam is not None:
-            viewmat = torch.from_numpy(view).to(device).unsqueeze(0)
-            with torch.inference_mode():
-                if means.shape[0]:
-                    rendered, _, _ = rasterization(
-                        means, quats, scales, opacities, colors,
-                        viewmat, K_t, render_w, render_h, packed=True,
-                    )
-                    frame = rendered[0].clamp(0, 1).mul(255).to(torch.uint8)[..., [2, 1, 0]]
-                    frame_bgr = frame.contiguous().cpu().numpy()
+            if web is not None:
+                for _ in range(256):
+                    try:
+                        action, dx, dy = web.commands.get_nowait()
+                    except Empty:
+                        break
+                    if cam is None:
+                        continue
+                    if action == "orbit":
+                        cam.azimuth -= dx * 0.005
+                        cam.elevation = np.clip(cam.elevation + dy * 0.005, -1.5, 1.5)
+                    elif action == "pan":
+                        cam.pan(dx, dy)
+                    elif action == "zoom":
+                        cam.radius = float(np.clip(cam.radius * 0.9 ** dx, 1e-3, 1e8))
+                    elif action == "reset":
+                        cam.reset()
+                    elif action == "flip":
+                        cam.up_sign *= -1
+                    elif action == "left":
+                        cam.roll -= 0.05
+                    elif action == "right":
+                        cam.roll += 0.05
+                    elif action == "straighten":
+                        cam.straighten()
+
+            fast = state["dragging"] is not None and interactive_scale < 1.0
+            render_w, render_h = (fast_w, fast_h) if fast else (width, height)
+            K_t = K_fast if fast else K_full
+            view = cam.viewmat() if cam is not None else None
+            size = (render_w, render_h)
+            redraw = updated or cached_size != size or not np.array_equal(view, cached_view)
+            if redraw and cam is not None:
+                viewmat = torch.from_numpy(view).to(device).unsqueeze(0)
+                with torch.inference_mode():
+                    if means.shape[0]:
+                        rendered, _, _ = rasterization(
+                            means, quats, scales, opacities, colors,
+                            viewmat, K_t, render_w, render_h, packed=True,
+                        )
+                        frame = rendered[0].clamp(0, 1).mul(255).to(torch.uint8)[..., [2, 1, 0]]
+                        frame_bgr = frame.contiguous().cpu().numpy()
+                    else:
+                        frame_bgr = np.zeros((render_h, render_w, 3), dtype=np.uint8)
+                if fast:
+                    frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
+                cached_view = view.copy()
+            cached_size = size
+            if redraw or status != cached_status or state["show_help"] != cached_help:
+                display = _draw_help(frame_bgr) if state["show_help"] else frame_bgr.copy()
+                if status:
+                    cv2.rectangle(display, (0, height - 36), (width, height), (0, 0, 0), -1)
+                    cv2.putText(display, status, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                if web is not None:
+                    web.publish(display)
                 else:
-                    frame_bgr = np.zeros((render_h, render_w, 3), dtype=np.uint8)
-            if fast:
-                frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
-            cached_view = view.copy()
-        cached_size = size
-        if redraw or status != cached_status or state["show_help"] != cached_help:
-            display = _draw_help(frame_bgr) if state["show_help"] else frame_bgr.copy()
-            if status:
-                cv2.rectangle(display, (0, height - 36), (width, height), (0, 0, 0), -1)
-                cv2.putText(display, status, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.imshow(window, display)
-            cached_status, cached_help = status, state["show_help"]
+                    cv2.imshow(window, display)
+                cached_status, cached_help = status, state["show_help"]
 
-        key = cv2.waitKey(16) & 0xFF
-        if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-            break
-        if cam is None:
-            continue
-        elif key in (ord("+"), ord("]")):
-            cam.radius *= 0.9
-        elif key in (ord("-"), ord("[")):
-            cam.radius *= 1.1
-        elif key == ord("u"):
-            cam.up_sign *= -1
-        elif key == ord("z"):
-            cam.roll -= 0.05
-        elif key == ord("c"):
-            cam.roll += 0.05
-        elif key == ord("x"):
-            cam.straighten()
-        elif key == ord("r"):
-            cam.reset()
-        elif key == ord("h"):
-            state["show_help"] = not state["show_help"]
+            if web is not None:
+                sleep(0.016)
+                continue
+            key = cv2.waitKey(16) & 0xFF
+            if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            if cam is None:
+                continue
+            elif key in (ord("+"), ord("]")):
+                cam.radius *= 0.9
+            elif key in (ord("-"), ord("[")):
+                cam.radius *= 1.1
+            elif key == ord("u"):
+                cam.up_sign *= -1
+            elif key == ord("z"):
+                cam.roll -= 0.05
+            elif key == ord("c"):
+                cam.roll += 0.05
+            elif key == ord("x"):
+                cam.straighten()
+            elif key == ord("r"):
+                cam.reset()
+            elif key == ord("h"):
+                state["show_help"] = not state["show_help"]
 
-    if preview is not None:
-        preview.close()
-    cv2.destroyWindow(window)
+    finally:
+        if preview is not None:
+            preview.close()
+        if web is not None:
+            web.close()
+        if desktop:
+            cv2.destroyWindow(window)
 
 
 if __name__ == "__main__":
@@ -288,5 +326,8 @@ if __name__ == "__main__":
         description="Show a gsplat model in the viewer"
     )
     parser.add_argument("model_path", type=Path, default=Path("runs/scene/model.glb"))
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--desktop", action="store_true", help="Use the original OpenCV window")
     args = parser.parse_args()
-    start_viewer(args.model_path)
+    start_viewer(args.model_path, host=args.host, port=args.port, desktop=args.desktop)

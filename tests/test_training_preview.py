@@ -61,7 +61,7 @@ class TrainingPreviewTests(unittest.TestCase):
              patch.object(cv2, 'getWindowProperty', return_value=1), \
              patch.object(cv2, 'waitKey', side_effect=wait), patch.object(cv2, 'destroyWindow'), \
              patch.object(viewer, 'rasterization', return_value=(torch.zeros(1, 64, 128, 3), None, None)) as raster:
-            viewer.start_viewer(None, 128, 64, preview=preview)
+            viewer.start_viewer(None, 128, 64, preview=preview, desktop=True)
         self.assertEqual(raster.call_count, 1)
         self.assertEqual(show.call_count, 3)  # preparation, preview, saved status
         self.assertTrue(preview.closed)

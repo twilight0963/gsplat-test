@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gaussian splat viewer</title>
+<style>
+body{margin:0;background:#111;color:#eee;font:16px system-ui;text-align:center}#view{width:100%;height:80vh;object-fit:contain;touch-action:none;user-select:none}button{padding:12px;margin:4px;background:#333;color:white;border:1px solid #777;border-radius:6px}p{margin:8px}
+</style>
+<img id="view" alt="Preparing viewer…" draggable="false">
+<div><button id="mode">Mode: orbit</button><button data-action="zoom" data-dx="1">Zoom in</button><button data-action="zoom" data-dx="-1">Zoom out</button><button data-action="reset">Reset</button><button data-action="flip">Flip up</button><button data-action="left">Roll left</button><button data-action="right">Roll right</button><button data-action="straighten">Straighten</button></div>
+<p>Drag to move the model. Pinch to zoom.</p><p id="status" role="status">Connecting…</p>
+<script>
+const view=document.querySelector('#view'),status=document.querySelector('#status');
+let mode='orbit',objectURL;
+async function refresh(){try{const r=await fetch('/frame.jpg',{cache:'no-store'});if(!r.ok)throw Error();const next=URL.createObjectURL(await r.blob());view.src=next;if(objectURL)URL.revokeObjectURL(objectURL);objectURL=next;status.textContent='Connected';}catch{status.textContent='Waiting for viewer…';}setTimeout(refresh,100);}refresh();
+let pending=[];let sending=false;
+async function send(action,dx=0,dy=0){if(pending.length<64)pending.push({action,dx,dy});if(sending)return;sending=true;try{while(pending.length){const r=await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pending.shift())});if(!r.ok)status.textContent='Control unavailable';}}catch{pending=[];status.textContent='Connection interrupted';}finally{sending=false;}}
+document.querySelector('#mode').onclick=e=>{mode=mode==='orbit'?'pan':'orbit';e.target.textContent='Mode: '+mode;};
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>send(b.dataset.action,Number(b.dataset.dx||0)));
+const pointers=new Map();const distance=()=>{const p=[...pointers.values()];return Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);};
+view.onpointerdown=e=>{view.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});};
+view.onpointermove=e=>{const old=pointers.get(e.pointerId);if(!old)return;const before=pointers.size===2?distance():0;pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.size===2){const after=distance();if(before>0&&after>0)send('zoom',Math.max(-10,Math.min(10,Math.log(before/after)/Math.log(.9))));}else{send(mode,Math.max(-1000,Math.min(1000,e.clientX-old.x)),Math.max(-1000,Math.min(1000,e.clientY-old.y)));}};
+view.onpointerup=view.onpointercancel=view.onlostpointercapture=e=>pointers.delete(e.pointerId);
+view.addEventListener('wheel',e=>{e.preventDefault();send('zoom',e.deltaY<0?1:-1);},{passive:false});
+</script></html>
