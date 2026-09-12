@@ -473,6 +473,7 @@ def build_model(
     contrast: float = 1.0,
     sharpness: float = 0.5
 ) -> Path:
+    print("Extracting and sharpening video frames...", flush=True)
     capture_dir = output / "capture"
     extract_frames(video, capture_dir, every, max_width, brightness, contrast, sharpness)
     undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
@@ -492,7 +493,7 @@ def build_model(
             )
             print("Exporting model...")
             export_gltf(result, glb_path)
-            print("Finished export.")
+            print(f"Model saved: {glb_path}", flush=True)
         except Exception as exc:
             preview.finish(exc)
             raise

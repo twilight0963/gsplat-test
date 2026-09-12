@@ -68,6 +68,7 @@ class ViewerHTTP:
         self.thread = Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         port = self.server.server_port
+        print(f"Viewer ready: http://localhost:{port}/", flush=True)
         if host == '0.0.0.0':
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
