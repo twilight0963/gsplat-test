@@ -9,8 +9,10 @@ from gsplat import rasterization
 import argparse
 from threading import Lock
 from queue import Empty
+import math
 from time import sleep
 from src.viewer_http import ViewerHTTP
+from src.clip_box import estimate_oriented_box, validate_box, validate_axes, box_view, half_volume_box, box_mask, draw_box
 
 
 class TrainingPreview:
@@ -121,6 +123,7 @@ _HELP_LINES = [
     "[ / ]  or  -/+: zoom     u: flip up",
     "z / c: roll     x: straighten (roll only)",
     "r: full reset     h: toggle help     q/esc: quit",
+    ", / .: splat size limit -/+ 0.1 (0 = off)",
 ]
 
 
@@ -141,6 +144,56 @@ def _draw_help(frame_bgr: np.ndarray) -> np.ndarray:
     return frame_bgr
 
 
+def _clamp_scale_outliers(scales: torch.Tensor, multiplier: float = 1.0) -> torch.Tensor:
+    """Cap extreme longest axes at Q3 + 3 IQR, preserving axis ratios.
+
+    Operates on the CPU snapshot before upload. Inputs are linear scales, not
+    the logarithms used by training; saved and training tensors are not mutated.
+    """
+    if not math.isfinite(multiplier) or not 0 <= multiplier <= 1000:
+        raise ValueError("Size clamp multiplier must be between 0 and 1000")
+    if multiplier == 0:
+        return scales
+    if scales.numel() == 0:
+        return scales
+    if not torch.isfinite(scales).all() or (scales < 0).any():
+        raise ValueError("Viewer splat scales must be finite and nonnegative")
+    largest = scales.amax(dim=-1)
+    positive = largest[largest > 0]
+    if positive.numel() < 4:
+        return scales  # Too few sizes to identify statistical outliers reliably.
+    q1, q3 = torch.quantile(positive.float(), torch.tensor([0.25, 0.75]))
+    ceiling = (q3 + 3 * (q3 - q1)) * multiplier
+    factor = (ceiling / largest.clamp_min(torch.finfo(scales.dtype).tiny)).clamp(max=1)
+    return scales * factor[:, None]
+
+
+def _clamp_at_box_edges(
+    scales: torch.Tensor,
+    local_positions: torch.Tensor,
+    bounds: torch.Tensor,
+    multiplier: float = 1.0,
+) -> torch.Tensor:
+    """Smooth reciprocal-size transition with a common limit near all faces."""
+    clamped = _clamp_scale_outliers(scales, multiplier)
+    if scales.numel() == 0 or multiplier == 0:
+        return scales
+    center = bounds.mean(dim=0)
+    half_extent = (bounds[1] - bounds[0]) * 0.5
+    distance = ((local_positions - center).abs() / half_extent).clamp(0, 1)
+    # Smootherstep per axis, then a smooth union of face influences. Unlike
+    # max(axis distance), this has no derivative seam where two faces tie.
+    face_weight = distance.pow(3) * (10 - 15 * distance + 6 * distance.square())
+    weight = (1 - (1 - face_weight).prod(dim=-1)).clamp(0, 1)
+    largest = scales.amax(dim=-1)
+    tiny = torch.finfo(scales.dtype).tiny
+    ratio = (clamped.amax(dim=-1) / largest.clamp_min(tiny)).clamp(min=tiny, max=1)
+    # Harmonic interpolation of sizes: huge originals cannot dominate the
+    # transition. For cap C, size is bounded above by C / weight away from center.
+    factor = ratio / (ratio + weight * (1 - ratio))
+    return scales * factor[:, None]
+
+
 def start_viewer(
     glb: Path | str | None,
     width: int = 1920,
@@ -151,13 +204,17 @@ def start_viewer(
     host: str = "0.0.0.0",
     port: int = 8000,
     desktop: bool = False,
+    size_clamp_multiplier: float = 1.0,
 ) -> None:
+    if not math.isfinite(size_clamp_multiplier) or not 0 <= size_clamp_multiplier <= 1000:
+        raise ValueError("Size clamp multiplier must be between 0 and 1000")
     if not torch.cuda.is_available():
         raise RuntimeError("This viewer needs a CUDA GPU (gsplat's rasterizer is CUDA-only).")
     device = "cuda"
     torch.backends.cudnn.benchmark = True
     data = read_gsplat_glb(Path(glb)) if preview is None else None
     cam = None
+    clip_bounds = None
 
     interactive_scale = min(max(interactive_scale, 0.1), 1.0)
     render_w, render_h = width, height
@@ -172,7 +229,7 @@ def start_viewer(
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, width, height)
     else:
-        web = ViewerHTTP(host, port)
+        web = ViewerHTTP(host, port, size_clamp_multiplier=size_clamp_multiplier)
 
     state = {"dragging": None, "last": (0, 0), "show_help": desktop}
 
@@ -200,6 +257,7 @@ def start_viewer(
     if desktop:
         cv2.setMouseCallback(window, on_mouse)
 
+    source_scales = None
     cached_view = None
     cached_size = None
     cached_status = None
@@ -215,15 +273,32 @@ def start_viewer(
                     raise error
                 updated = data is not None
             if updated:
+                if clip_bounds is None:
+                    if "clip_axes" in data and "clip_bounds" in data:
+                        clip_bounds = validate_box(data["clip_bounds"])
+                        clip_axes = validate_axes(data["clip_axes"])
+                    else:
+                        # Legacy models have no orientation; infer it from their cloud.
+                        clip_bounds, clip_axes = estimate_oriented_box(data["means"].numpy())
+                    # Apply once in the viewer, so existing files and live previews
+                    # use the same crop without shrinking saved bounds repeatedly.
+                    clip_bounds = half_volume_box(clip_bounds)
+                bounds_t = torch.from_numpy(clip_bounds)
+                local_means = data["means"] @ torch.from_numpy(clip_axes)
+                keep = ((local_means >= bounds_t[0]) & (local_means <= bounds_t[1])).all(dim=-1)
+                data = {key: value[keep] if key in ("means", "quats", "scales", "opacities", "colors") else value
+                        for key, value in data.items()}
                 means = data["means"].to(device)
                 quats = data["quats"].to(device)
-                scales = data["scales"].to(device)
+                source_scales = data["scales"]
+                source_positions = local_means[keep]
+                scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
                 opacities = data["opacities"].to(device)
                 colors = data["colors"].to(device)
                 if cam is None and len(data["means"]):
                     means_np = data["means"].numpy()
-                    target = means_np.mean(axis=0)
-                    radius = float(np.linalg.norm(means_np - target, axis=1).max()) * 1.5 or 1.0
+                    target = clip_bounds.mean(axis=0) @ clip_axes.T
+                    radius = float(np.linalg.norm(clip_bounds[1] - clip_bounds[0])) * 0.9
                     cam = OrbitCamera(target, radius)
                 data = None
 
@@ -233,6 +308,12 @@ def start_viewer(
                         action, dx, dy = web.commands.get_nowait()
                     except Empty:
                         break
+                    if action == "size_clamp":
+                        size_clamp_multiplier = dx
+                        if source_scales is not None:
+                            scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
+                            cached_view = None
+                        continue
                     if cam is None:
                         continue
                     if action == "orbit":
@@ -273,6 +354,11 @@ def start_viewer(
                         frame_bgr = np.zeros((render_h, render_w, 3), dtype=np.uint8)
                 if fast:
                     frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
+                # Mask after resizing too, so interpolation cannot bleed past the boundary.
+                K_display = make_K(width, height, fov)
+                clip_view = box_view(view, clip_axes)
+                frame_bgr[~box_mask(clip_bounds, clip_view, K_display, width, height)] = 0
+                draw_box(frame_bgr, clip_bounds, clip_view, K_display)
                 cached_view = view.copy()
             cached_size = size
             if redraw or status != cached_status or state["show_help"] != cached_help:
@@ -281,6 +367,12 @@ def start_viewer(
                     cv2.rectangle(display, (0, height - 36), (width, height), (0, 0, 0), -1)
                     cv2.putText(display, status, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                if desktop:
+                    limit_text = f"Edge size limit: {size_clamp_multiplier:.1f}"
+                    if size_clamp_multiplier == 0:
+                        limit_text += " (off)"
+                    cv2.putText(display, limit_text, (8, max(18, height - 46)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 if web is not None:
                     web.publish(display)
                 else:
@@ -295,6 +387,12 @@ def start_viewer(
                 break
             if cam is None:
                 continue
+            elif key in (ord(","), ord(".")):
+                delta = 0.1 if key == ord(".") else -0.1
+                size_clamp_multiplier = min(1000., max(0., round(size_clamp_multiplier + delta, 1)))
+                if source_scales is not None:
+                    scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
+                    cached_view = None
             elif key in (ord("+"), ord("]")):
                 cam.radius *= 0.9
             elif key in (ord("-"), ord("[")):
@@ -329,5 +427,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--desktop", action="store_true", help="Use the original OpenCV window")
+    parser.add_argument("--size-clamp-multiplier", type=float, default=1.0,
+                        help="Multiply the size cutoff; higher permits larger splats, 0 disables clamping")
     args = parser.parse_args()
-    start_viewer(args.model_path, host=args.host, port=args.port, desktop=args.desktop)
+    start_viewer(args.model_path, host=args.host, port=args.port, desktop=args.desktop, size_clamp_multiplier=args.size_clamp_multiplier)

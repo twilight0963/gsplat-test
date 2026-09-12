@@ -15,6 +15,7 @@ import pycolmap
 import torch
 import torch.nn.functional as F
 from gsplat import rasterization
+from src.clip_box import estimate_oriented_box
 from src.gsplat_viewer import TrainingPreview, start_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
@@ -312,6 +313,9 @@ def train_splats(
     from scipy.spatial import cKDTree
 
     means_np = data["means"].detach().cpu().numpy()
+    bounds_np, axes_np = estimate_oriented_box(means_np)
+    clip_bounds = torch.from_numpy(bounds_np)
+    clip_axes = torch.from_numpy(axes_np)
     tree = cKDTree(means_np)
     if len(means_np) < 2:
         raise ValueError("At least two reconstructed points are required")
@@ -363,6 +367,8 @@ def train_splats(
         ):
             with torch.no_grad():
                 snapshot = {
+                    "clip_bounds": clip_bounds,
+                    "clip_axes": clip_axes,
                     "means": means.detach().cpu().clone(),
                     "colors": colors.detach().sigmoid().cpu(),
                     "scales": scales.detach().clamp(max=max_log_scale).exp().cpu(),
@@ -397,7 +403,7 @@ def train_splats(
         scales_c = scales.clamp(max=max_log_scale)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-            rendered, _, _ = rasterization(
+            rendered, _, render_info = rasterization(
                 means, quats_n, scales_c.exp(), opacities.sigmoid(), colors.sigmoid(),
                 viewmats, Ks, width, height, packed=True,
             )
@@ -409,6 +415,9 @@ def train_splats(
         loss.backward()
 
         if voxel_opt is not None:
+            voxel_opt.record_visible_views(
+                render_info["gaussian_ids"], render_info["camera_ids"], idx
+            )
             voxel_opt.accumulate_step(means)
             voxel_opt.dampen_gradients(means, scales, colors, quats, opacities)
 
@@ -436,6 +445,8 @@ def train_splats(
         scales.copy_(scales.clamp(max=max_log_scale))
 
     return {
+        "clip_bounds": clip_bounds,
+        "clip_axes": clip_axes,
         "means": means.detach().cpu(),
         "colors": colors.detach().sigmoid().cpu(),
         "scales": scales.detach().cpu(),
@@ -450,7 +461,8 @@ def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     quats = result["quats"].numpy().astype(np.float32)
     opacities = torch.sigmoid(result["opacities"]).numpy().astype(np.float32)
 
-    write_gsplat_glb(path, means, scales, quats, opacities, colors)
+    write_gsplat_glb(path, means, scales, quats, opacities, colors,
+                     clip_bounds=result.get("clip_bounds"), clip_axes=result.get("clip_axes"))
 
 
 def build_model(

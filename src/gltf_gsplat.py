@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from src.clip_box import validate_box, validate_axes
 
 SH_C0 = 0.28209479177387814
 
@@ -42,6 +43,8 @@ def write_gsplat_glb(
     opacities: np.ndarray,
     colors: np.ndarray,
     color_space: str = "srgb_rec709_display",
+    clip_bounds=None,
+    clip_axes=None,
 ) -> None:
     n = means.shape[0]
     means = means.astype(np.float32)
@@ -131,6 +134,11 @@ def write_gsplat_glb(
         "accessors": accessors,
     }
 
+    if clip_bounds is not None:
+        gltf["extras"] = {"gsplat_clip_bounds": validate_box(clip_bounds).tolist()}
+        if clip_axes is not None:
+            gltf["extras"]["gsplat_clip_axes"] = validate_axes(clip_axes).tolist()
+
     json_chunk = _pad(json.dumps(gltf, separators=(",", ":")).encode("utf-8"), b" ")
     bin_chunk = _pad(bytes(buffer), b"\x00")
 
@@ -214,10 +222,17 @@ def read_gsplat_glb(path: Path) -> dict[str, torch.Tensor]:
     opacities = np.clip(opacities, 0.0, 1.0).astype(np.float32)
     scales = np.clip(scales, 0.0, None).astype(np.float32)
 
-    return {
+    result = {
         "means": torch.from_numpy(means.astype(np.float32)),
         "colors": torch.from_numpy(colors),
         "scales": torch.from_numpy(scales),
         "quats": torch.from_numpy(quats_wxyz.astype(np.float32)),
         "opacities": torch.from_numpy(opacities),
     }
+    bounds = gltf.get("extras", {}).get("gsplat_clip_bounds")
+    if bounds is not None:
+        result["clip_bounds"] = torch.from_numpy(validate_box(bounds))
+    axes = gltf.get("extras", {}).get("gsplat_clip_axes")
+    if axes is not None:
+        result["clip_axes"] = torch.from_numpy(validate_axes(axes))
+    return result

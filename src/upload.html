@@ -1,20 +1,20 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Drone video to 3D</title>
 <style>body{font:16px system-ui;background:#101720;color:#eef3f9;margin:0}main{max-width:760px;margin:40px auto;padding:24px}h1{font-size:30px}form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}label{display:grid;gap:7px}input,button{font:inherit;padding:12px;border:1px solid #526174;border-radius:8px;background:#1c2838;color:inherit}small{color:#b6c4d4}.wide{grid-column:1/-1}button{background:#2867c7;cursor:pointer}button:disabled{opacity:.5}#status{white-space:pre-wrap;overflow-wrap:anywhere;padding:20px;background:#1c2838;border-radius:8px}a{color:#8fc0ff}progress{width:100%}@media(max-width:500px){form{grid-template-columns:1fr}.wide{grid-column:auto}}</style>
-<main><h1>Drone video to 3D</h1><p>Upload a video, choose your settings, and follow the reconstruction.</p>
+<main><h1>Fly-By Render</h1><p>Choose your settings and build a 3D Reconstruction.</p>
 <form id="form">
-<label class="wide">Drone video<input name="video" type="file" accept="video/*,.mkv,.avi,.mov,.mp4" required></label>
-<label>Training steps<input name="steps" type="number" value="2000" min="1" max="1000000" required><small>More steps give training more time to refine the model.</small></label>
-<label>Keep every Nth frame<input name="every" type="number" value="5" min="1" max="100000" required><small>Lower values use more frames.</small></label>
-<label>Maximum width<input name="max-width" type="number" value="1920" min="0" max="16384" required><small>Pixels; 0 keeps the original width.</small></label>
-<label>Output folder<input name="output" required pattern="runs/.+"><small>A new folder inside runs/ on the computer.</small></label>
-<label>Brightness<input name="brightness" type="number" value="1" min="-255" max="255" step="any" required><small>Additive pixel offset; 0 makes no brightness adjustment.</small></label>
-<label>Contrast<input name="contrast" type="number" value="1" min="0" max="10" step="any" required><small>Multiplier; 1 keeps the original contrast.</small></label>
-<label>Sharpness<input name="sharpness" type="number" value="0.5" min="0" max="1" step="any" required><small>CAS sharpening strength, from 0 to 1.</small></label>
-<button class="wide" id="build">Upload and build</button></form>
+<label class="wide">Input video<input name="video" type="file" accept="video/*,.mkv,.avi,.mov,.mp4" required></label>
+<label>Training steps<input name="steps" type="number" value="2000" min="1" max="1000000" required><small>Steps improves the general quality and detail level.</small></label>
+<label>Keep every Nth frame<input name="every" type="number" value="5" min="1" max="100000" required><small>Lower values require higher processing.</small></label>
+<label>Maximum width<input name="max-width" type="number" value="1920" min="0" max="16384" required><small>Maximum resolution.</small></label>
+<label>Output folder<input name="output" required pattern="runs/.+"><small>Folder contains capture images, colmap data, and model.</small></label>
+<label>Brightness<input name="brightness" type="number" value="1" min="-255" max="255" step="any" required><small>Brightness multiplier</small></label>
+<label>Contrast<input name="contrast" type="number" value="1" min="0" max="10" step="any" required><small>Contrast multiplier</small></label>
+<label>CAS-Effectiveness<input name="sharpness" type="number" value="0.5" min="0" max="1" step="any" required><small>CAS sharpening multiplier</small></label>
+<button class="wide" id="build">Upload & build</button></form>
 <p id="upload"></p><progress id="progress" max="100" value="0" hidden></progress>
-<h2>Current activity</h2><div id="status" role="status" aria-live="polite">Ready to upload</div>
-<p><a id="viewer" target="_blank" rel="noopener" hidden>Open viewer</a></p>
-<p><small>Keep this page open to launch the viewer automatically. A waiting tab opens when you start. One model session runs at a time.</small></p></main>
+<h2>Current activity</h2><div id="status" role="status" aria-live="polite">Ready to upload!</div>
+<p><small>Keep this page open to launch the viewer automatically.</small></p></main>
+<p><a id="viewer" target="_blank" rel="noopener" hidden>Or click here to open viewer</a></p>
 <script>
 const form=document.querySelector('#form'),statusBox=document.querySelector('#status'),build=document.querySelector('#build'),link=document.querySelector('#viewer');
 form.elements.output.value='runs/web-'+new Date().toISOString().replace(/[:.]/g,'-');

@@ -11,11 +11,11 @@ import cv2
 
 
 class ViewerHTTP:
-    def __init__(self, host='0.0.0.0', port=8000):
+    def __init__(self, host='0.0.0.0', port=8000, size_clamp_multiplier=1.0):
         self.commands = Queue(maxsize=256)
         self.lock = Lock()
         self.frame = None
-        page = Path(__file__).with_name('viewer.html').read_bytes()
+        page = Path(__file__).with_name('viewer.html').read_bytes().replace(b'__CLAMP_VALUE__', str(float(size_clamp_multiplier)).encode())
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -53,11 +53,13 @@ class ViewerHTTP:
                         raise ValueError('Invalid length')
                     command = json.loads(self.rfile.read(length))
                     action = command['action']
-                    if action not in ('orbit', 'pan', 'zoom', 'reset', 'flip', 'left', 'right', 'straighten'):
+                    if action not in ('orbit', 'pan', 'zoom', 'reset', 'flip', 'left', 'right', 'straighten', 'size_clamp'):
                         raise ValueError('Invalid action')
                     values = [float(command.get(k, 0)) for k in ('dx', 'dy')]
                     if not all(math.isfinite(v) and abs(v) <= 1000 for v in values):
                         raise ValueError('Invalid movement')
+                    if action == "size_clamp" and values[0] < 0:
+                        raise ValueError("Invalid size clamp")
                     owner.commands.put_nowait((action, *values))
                 except (ValueError, KeyError, TypeError, Full):
                     self.reply(400, b'Invalid control')

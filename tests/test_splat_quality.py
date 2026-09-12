@@ -35,6 +35,7 @@ class SplatQualityTests(unittest.TestCase):
         voxel.cfg.max_gaussians = 3
         voxel.grad_accum.fill_(1)
         voxel.grad_count.fill_(1)
+        voxel.seen_views[:] = torch.tensor([0, 1, 2])
         p = voxel._densify(opt, p)
         self.assertEqual(len(p['means']), 3)
         for _ in range(2):

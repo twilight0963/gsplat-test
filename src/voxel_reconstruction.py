@@ -21,6 +21,7 @@ class VoxelGuidedConfig:
     prune_opacity: float = 0.005
     max_axis_ratio: float = 10.0
     scale_regularization: float = 0.01
+    min_grow_views: int = 3
 
 
 
@@ -56,12 +57,30 @@ class VoxelGuidedOptimizer:
         n = init_means.shape[0]
         self.grad_accum = torch.zeros((n, 3), device=device)
         self.grad_count = torch.zeros(n, device=device)
+        self.seen_views = torch.full((n, config.min_grow_views), -1, dtype=torch.long, device=device)
         self.refine_after = 0
 
     def pause_after_reset(self, step: int, recovery_steps: int) -> None:
         self.refine_after = step + recovery_steps
         self.grad_accum.zero_()
         self.grad_count.zero_()
+        self.seen_views.fill_(-1)
+
+    @torch.no_grad()
+    def record_visible_views(self, gaussian_ids, camera_ids, view_ids) -> None:
+        """Record distinct dataset cameras, not repeated visits to one camera."""
+        if not self.cfg.min_grow_views:
+            return
+        for camera in range(len(view_ids)):
+            ids = gaussian_ids[camera_ids == camera].unique()
+            seen = self.seen_views[ids]
+            view = view_ids[camera]
+            new = ~(seen == view).any(dim=1)
+            for slot in range(self.cfg.min_grow_views):
+                insert = new & (seen[:, slot] < 0)
+                seen[:, slot] = torch.where(insert, view, seen[:, slot])
+                new &= ~insert
+            self.seen_views[ids] = seen
 
 
 
@@ -145,6 +164,7 @@ class VoxelGuidedOptimizer:
         if means.shape[0] >= self.cfg.max_gaussians:
             self.grad_accum.zero_()
             self.grad_count.zero_()
+            self.seen_views.fill_(-1)
             return params
         with torch.no_grad():
             avg_grad = self.grad_accum / self.grad_count.clamp_min(1).unsqueeze(-1)
@@ -157,6 +177,8 @@ class VoxelGuidedOptimizer:
             unconstrained = torch.maximum(drift, max_linear_scale) > self.cfg.tau * self.voxel_size
 
             candidates = unconstrained & (avg_grad_norm > self.cfg.gamma1)
+            if self.cfg.min_grow_views:
+                candidates &= (self.seen_views >= 0).all(dim=1)
             if candidates.any():
                 direction = torch.sign(avg_grad[candidates])
                 target_ijk = ijk[candidates] + direction.to(torch.int64)
@@ -169,6 +191,17 @@ class VoxelGuidedOptimizer:
             else:
                 grow_idx = means.new_zeros((0,), dtype=torch.long)
                 grow_target_flat = means.new_zeros((0,), dtype=torch.long)
+
+        if grow_idx.numel():
+            # Keep the strongest candidate per empty target voxel, preventing
+            # many simultaneous clones from piling up at the same center.
+            order = torch.argsort(avg_grad_norm[grow_idx], descending=True, stable=True)
+            targets = grow_target_flat[order]
+            _, inverse = torch.unique(targets, return_inverse=True)
+            first = torch.full((int(inverse.max().item()) + 1,), len(order), device=order.device, dtype=torch.long)
+            first.scatter_reduce_(0, inverse, torch.arange(len(order), device=order.device), reduce="amin")
+            selected = order[first]
+            grow_idx, grow_target_flat = grow_idx[selected], grow_target_flat[selected]
 
         capacity = self.cfg.max_gaussians - means.shape[0]
         if grow_idx.numel() > capacity:
@@ -189,12 +222,14 @@ class VoxelGuidedOptimizer:
             self.voxel_id = torch.cat([self.voxel_id, grow_target_flat])
             self.grad_accum = torch.cat([self.grad_accum, torch.zeros_like(self.grad_accum[grow_idx])])
             self.grad_count = torch.cat([self.grad_count, torch.zeros_like(self.grad_count[grow_idx])])
+            self.seen_views = torch.cat([self.seen_views, torch.full_like(self.seen_views[grow_idx], -1)])
 
 
 
 
         self.grad_accum.zero_()
         self.grad_count.zero_()
+        self.seen_views.fill_(-1)
         return params
 
     def _prune(self, optimizer, params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -225,6 +260,7 @@ class VoxelGuidedOptimizer:
         self.voxel_id = self.voxel_id[keep]
         self.grad_accum = self.grad_accum[keep]
         self.grad_count = self.grad_count[keep]
+        self.seen_views = self.seen_views[keep]
         return params
 
 
