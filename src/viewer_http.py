@@ -11,7 +11,7 @@ import cv2
 
 
 class ViewerHTTP:
-    def __init__(self, host='0.0.0.0', port=8000, size_clamp_multiplier=1.0):
+    def __init__(self, host='0.0.0.0', port=8000, size_clamp_multiplier=1.0, preview_directory=None):
         self.commands = Queue(maxsize=256)
         self.lock = Lock()
         self.frame = None
@@ -34,6 +34,8 @@ class ViewerHTTP:
                 path = self.path.split('?', 1)[0]
                 if path == '/':
                     self.reply(200, page, 'text/html; charset=utf-8')
+                elif path == '/health':
+                    self.reply(200, json.dumps({'preview_directory': preview_directory}).encode(), 'application/json')
                 elif path == '/frame.jpg':
                     with owner.lock:
                         frame = owner.frame

@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlsplit
+import socket
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -49,7 +50,7 @@ class Jobs:
     def reserve(self):
         with self.lock:
             if self.state['busy'] or (self.process is not None and self.process.poll() is None):
-                raise ValueError('A model session is already running. Restart this server for another run.')
+                raise ValueError('A training job is already running. Wait for it to finish before uploading again.')
             self.state = {'busy': True, 'status': 'Receiving video…', 'viewer': False, 'saved': False}
 
     def fail(self, message):
@@ -84,7 +85,7 @@ class Jobs:
         code = process.wait()
         with self.lock:
             self.state['busy'] = False
-            self.state['viewer'] = False
+            # The detached viewer survives engine exit.
             if code:
                 self.state['status'] = f'Failed (exit {code}): ' + self.state['status']
 
@@ -164,7 +165,7 @@ def make_server(host, port, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description='Upload a drone video and build a model in your browser')
-    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8001)
     args = parser.parse_args()
     if args.port == 8000:
@@ -172,7 +173,13 @@ def main():
     jobs = Jobs()
     server = make_server(args.host, args.port, jobs)
     print(f'Upload interface: http://localhost:{server.server_port}/', flush=True)
-    print(f'Listening on {args.host}:{server.server_port}; viewer uses port 8000', flush=True)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('192.0.2.1', 80))  # Route lookup; sends no packet.
+            address = probe.getsockname()[0]
+        print(f'Join from phone: http://{address}:{args.port}/', flush=True)
+    except OSError:
+        print("Unable to find IP!")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

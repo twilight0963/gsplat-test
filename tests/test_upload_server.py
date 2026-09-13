@@ -27,6 +27,11 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(jobs.snapshot()['status'], 'Model saved: runs/x/model.glb')
         self.assertTrue(jobs.snapshot()['saved'])
         self.assertFalse(jobs.snapshot()['busy'])
+        self.assertTrue(jobs.snapshot()['viewer'])
+        jobs.process.poll.return_value = 0
+        jobs.reserve()
+        self.assertTrue(jobs.snapshot()['busy'])
+        self.assertFalse(jobs.snapshot()['saved'])
 
     def test_http_upload_stream_and_launch(self):
         jobs=Jobs()

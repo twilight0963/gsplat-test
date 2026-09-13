@@ -4,7 +4,6 @@ import argparse
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
@@ -16,7 +15,8 @@ import torch
 import torch.nn.functional as F
 from gsplat import rasterization
 from src.clip_box import estimate_oriented_box
-from src.gsplat_viewer import TrainingPreview, start_viewer
+from src.gsplat_viewer import TrainingPreview
+from src.live_viewer import PreviewPublisher, ensure_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
 
@@ -286,7 +286,7 @@ def train_splats(
     means_lr_final_ratio: float = 0.01,
     opacity_reset_interval: int = 3000,
     mixed_precision: bool = True,
-    preview: TrainingPreview | None = None,
+    preview: TrainingPreview | PreviewPublisher | None = None,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -493,32 +493,24 @@ def build_model(
     data, images, width, height = load_reconstruction(undistorted, max_points)
     print("Training splats...")
     glb_path = output / "model.glb"
-    preview = TrainingPreview()
-
-    def train_and_export():
-        try:
-            result = train_splats(
-                data, images, width, height, steps, device, view_batch_size,
-                voxel_guided, voxel_config,
-                means_lr_init, means_lr_final_ratio,
-                opacity_reset_interval, mixed_precision, preview=preview,
-            )
-            print("Exporting model...")
-            export_gltf(result, glb_path)
-            print(f"Model saved: {glb_path}", flush=True)
-        except Exception as exc:
-            preview.finish(exc)
-            raise
-        else:
-            preview.finish()
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        training = pool.submit(train_and_export)
-        try:
-            start_viewer(None, width, height, preview=preview)
-        finally:
-            preview.close()
-        training.result()
+    preview = PreviewPublisher(Path(__file__).resolve().parent.parent / "runs" / ".viewer")
+    try:
+        ensure_viewer(preview.directory, width, height)
+        result = train_splats(
+            data, images, width, height, steps, device, view_batch_size,
+            voxel_guided, voxel_config,
+            means_lr_init, means_lr_final_ratio,
+            opacity_reset_interval, mixed_precision, preview=preview,
+        )
+        print("Exporting model...", flush=True)
+        export_gltf(result, glb_path)
+        preview.finish()
+        print(f"Model saved: {glb_path}", flush=True)
+    except Exception as exc:
+        preview.finish(exc)
+        raise
+    finally:
+        preview.close()
     return glb_path
 
 

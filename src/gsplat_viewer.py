@@ -229,7 +229,8 @@ def start_viewer(
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, width, height)
     else:
-        web = ViewerHTTP(host, port, size_clamp_multiplier=size_clamp_multiplier)
+        web = ViewerHTTP(host, port, size_clamp_multiplier=size_clamp_multiplier,
+                         preview_directory=str(preview.directory.resolve()) if hasattr(preview, "directory") else None)
 
     state = {"dragging": None, "last": (0, 0), "show_help": desktop}
 
@@ -273,6 +274,11 @@ def start_viewer(
                     raise error
                 updated = data is not None
             if updated:
+                if data.pop("_new_session", False):
+                    cam = None
+                    clip_bounds = None
+                    cached_view = None
+                    state["dragging"] = None
                 if clip_bounds is None:
                     if "clip_axes" in data and "clip_bounds" in data:
                         clip_bounds = validate_box(data["clip_bounds"])
