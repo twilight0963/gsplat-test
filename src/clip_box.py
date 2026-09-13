@@ -121,3 +121,53 @@ def draw_box(frame, bounds, view, K):
             ok, pa, pb = cv2.clipLine((0, 0, frame.shape[1], frame.shape[0]), pa, pb)
             if ok:
                 cv2.line(frame, pa, pb, (80, 220, 255), 1, cv2.LINE_AA)
+
+
+def fit_subject_box(points):
+    """Fit completed geometry around its largest connected dense region.
+
+    Density guides estimation only; no rendering mask is returned. Duplicate
+    centers do not inflate support, and sparse background cannot set the center.
+    """
+    from scipy.spatial import cKDTree
+    points = np.asarray(points, dtype=np.float64)
+    points = np.unique(points[np.isfinite(points).all(axis=1)], axis=0)
+    if len(points) < 17:
+        return estimate_oriented_box(points)
+    distances, _ = cKDTree(points).query(points, k=17)
+    radius = float(np.quantile(distances[:, -1], 0.6))
+    support = points[distances[:, -1] <= radius * (1 + 1e-10)]
+    if radius <= 0 or not len(support):
+        return estimate_oriented_box(points)
+    cells, inverse, counts = np.unique(
+        np.floor((support - support.min(axis=0)) / radius).astype(np.int64),
+        axis=0, return_inverse=True, return_counts=True,
+    )
+    lookup = {tuple(cell): i for i, cell in enumerate(cells)}
+    labels = np.full(len(cells), -1, dtype=int)
+    masses = []
+    offsets = [offset for offset in product((-1, 0, 1), repeat=3) if offset != (0, 0, 0)]
+    for seed in range(len(cells)):
+        if labels[seed] >= 0:
+            continue
+        label = len(masses)
+        labels[seed] = label
+        stack, mass = [seed], 0
+        while stack:
+            i = stack.pop()
+            mass += int(counts[i])
+            x, y, z = cells[i]
+            for dx, dy, dz in offsets:
+                j = lookup.get((x + dx, y + dy, z + dz))
+                if j is not None and labels[j] < 0:
+                    labels[j] = label
+                    stack.append(j)
+        masses.append(mass)
+    subject = support[labels[inverse] == np.argmax(masses)]
+    _, axes = estimate_oriented_box(subject)
+    local = subject @ axes
+    center = np.median(local, axis=0)
+    # Size symmetrically about the subject center. Do not halve afterward:
+    # that previously cropped the very region used to estimate the box.
+    half = max(float(np.quantile(np.abs(local - center), 0.99, axis=0).max()) * 1.05, 1e-3)
+    return validate_box(np.stack([center - half, center + half])), axes

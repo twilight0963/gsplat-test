@@ -2,11 +2,11 @@
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gaussian splat viewer</title>
 <style>
-body{margin:0;background:#111;color:#eee;font:16px system-ui;text-align:center}#view{width:100%;height:80vh;object-fit:contain;touch-action:none;user-select:none}button{padding:12px;margin:4px;background:#333;color:white;border:1px solid #777;border-radius:6px}p{margin:8px}
+body{margin:0;background:#111;color:#eee;font:16px system-ui;text-align:center}#view{width:100%;height:80vh;object-fit:contain;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-user-drag:none}button{padding:12px;margin:4px;background:#333;color:white;border:1px solid #777;border-radius:6px}p{margin:8px}
 </style>
-<img id="view" alt="Preparing viewer…" draggable="false">
+<img id="view" alt="Preparing viewer…" draggable="false" style="-moz-user-select: none; -webkit-user-select: none; user-select: none;">
 <div><button id="mode">Mode: orbit</button><button data-action="zoom" data-dx="1">Zoom in</button><button data-action="zoom" data-dx="-1">Zoom out</button><button data-action="reset">Reset</button><button data-action="flip">Flip up</button><button data-action="left">Roll left</button><button data-action="right">Roll right</button><button data-action="straighten">Straighten</button></div>
-<p><label for="clamp">Splat size limit at edges: <output id="clamp-value" for="clamp"></output></label><br><input id="clamp" type="range" min="0" max="10" step="0.1" value="__CLAMP_VALUE__" style="width:min(85%,480px)"><br><small>Adjusts live in steps of 0.1. No clamp at the box center; gradually stronger toward edges. Higher allows larger splats. 0 = off.</small></p>
+<p><label for="clamp">Splat size limit at edges: <output id="clamp-value" for="clamp"></output></label><br><input id="clamp" type="range" min="0" max="10" step="0.1" value="__CLAMP_VALUE__" style="width:min(85%,480px)"><br><small>Adjust the blurriness near the image edges. Lower values may result in empty patches!</small></p>
 <p>Drag to move the model. Pinch to zoom.</p><p id="status" role="status">Connecting…</p>
 <script>
 const view=document.querySelector('#view'),status=document.querySelector('#status');
@@ -22,7 +22,8 @@ clampInput.max=Math.max(10,Math.ceil(initialClamp));clampInput.value=initialClam
 function showClamp(){clampValue.textContent=Number(clampInput.value).toFixed(1)+(Number(clampInput.value)===0?' (off)':'');}showClamp();
 clampInput.oninput=()=>{showClamp();pending=pending.filter(command=>command.action!=='size_clamp');send('size_clamp',Number(clampInput.value));};
 const pointers=new Map();const distance=()=>{const p=[...pointers.values()];return Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);};
-view.onpointerdown=e=>{view.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});};
+for(const event of ['dragstart','selectstart','contextmenu'])view.addEventListener(event,e=>e.preventDefault());
+view.onpointerdown=e=>{e.preventDefault();view.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});};
 view.onpointermove=e=>{const old=pointers.get(e.pointerId);if(!old)return;const before=pointers.size===2?distance():0;pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.size===2){const after=distance();if(before>0&&after>0)send('zoom',Math.max(-10,Math.min(10,Math.log(before/after)/Math.log(.9))));}else{send(mode,Math.max(-1000,Math.min(1000,e.clientX-old.x)),Math.max(-1000,Math.min(1000,e.clientY-old.y)));}};
 view.onpointerup=view.onpointercancel=view.onlostpointercapture=e=>pointers.delete(e.pointerId);
 view.addEventListener('wheel',e=>{e.preventDefault();send('zoom',e.deltaY<0?1:-1);},{passive:false});

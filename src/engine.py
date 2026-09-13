@@ -14,7 +14,7 @@ import pycolmap
 import torch
 import torch.nn.functional as F
 from gsplat import rasterization
-from src.clip_box import estimate_oriented_box
+from src.clip_box import estimate_oriented_box, fit_subject_box
 from src.gsplat_viewer import TrainingPreview
 from src.live_viewer import PreviewPublisher, ensure_viewer
 from src.gltf_gsplat import write_gsplat_glb
@@ -444,7 +444,7 @@ def train_splats(
         quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
         scales.copy_(scales.clamp(max=max_log_scale))
 
-    return {
+    result = {
         "clip_bounds": clip_bounds,
         "clip_axes": clip_axes,
         "means": means.detach().cpu(),
@@ -453,6 +453,15 @@ def train_splats(
         "quats": quats.detach().cpu(),
         "opacities": opacities.detach().cpu(),
     }
+    print("Fitting final bounding box around the dense subject...", flush=True)
+    final_bounds, final_axes = fit_subject_box(result["means"].numpy())
+    result.update(clip_bounds=torch.from_numpy(final_bounds),
+                  clip_axes=torch.from_numpy(final_axes), clip_final=torch.tensor(True))
+    if preview is not None and not preview.closed:
+        preview.publish({**result, "scales": result["scales"].exp(),
+                         "opacities": result["opacities"].sigmoid()}, steps, steps)
+    return result
+
 
 def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     means = result["means"].numpy().astype(np.float32)
@@ -462,7 +471,8 @@ def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     opacities = torch.sigmoid(result["opacities"]).numpy().astype(np.float32)
 
     write_gsplat_glb(path, means, scales, quats, opacities, colors,
-                     clip_bounds=result.get("clip_bounds"), clip_axes=result.get("clip_axes"))
+                     clip_bounds=result.get("clip_bounds"), clip_axes=result.get("clip_axes"),
+                     clip_final=bool(result.get("clip_final", False)))
 
 
 def build_model(

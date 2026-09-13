@@ -45,6 +45,7 @@ def write_gsplat_glb(
     color_space: str = "srgb_rec709_display",
     clip_bounds=None,
     clip_axes=None,
+    clip_final=False,
 ) -> None:
     n = means.shape[0]
     means = means.astype(np.float32)
@@ -136,6 +137,7 @@ def write_gsplat_glb(
 
     if clip_bounds is not None:
         gltf["extras"] = {"gsplat_clip_bounds": validate_box(clip_bounds).tolist()}
+        gltf["extras"]["gsplat_clip_final"] = bool(clip_final)
         if clip_axes is not None:
             gltf["extras"]["gsplat_clip_axes"] = validate_axes(clip_axes).tolist()
 
@@ -235,4 +237,6 @@ def read_gsplat_glb(path: Path) -> dict[str, torch.Tensor]:
     axes = gltf.get("extras", {}).get("gsplat_clip_axes")
     if axes is not None:
         result["clip_axes"] = torch.from_numpy(validate_axes(axes))
+    if gltf.get("extras", {}).get("gsplat_clip_final", False):
+        result["clip_final"] = torch.tensor(True)
     return result

@@ -12,7 +12,7 @@ from queue import Empty
 import math
 from time import sleep
 from src.viewer_http import ViewerHTTP
-from src.clip_box import estimate_oriented_box, validate_box, validate_axes, box_view, half_volume_box, box_mask, draw_box
+from src.clip_box import estimate_oriented_box, validate_box, validate_axes, box_view, half_volume_box, box_mask, draw_box, fit_subject_box
 
 
 class TrainingPreview:
@@ -51,7 +51,7 @@ from src.gltf_gsplat import read_gsplat_glb
 
 
 class OrbitCamera:
-    def __init__(self, target: np.ndarray, radius: float):
+    def __init__(self, target: np.ndarray, radius: float, box_axes: np.ndarray | None = None):
         self.target = target.copy()
         self.default_target = target.copy()
         self.radius = radius
@@ -59,7 +59,21 @@ class OrbitCamera:
         self.azimuth = 0.0
         self.elevation = 0.3
         self.roll = 0.0
-        self.up_sign = 1.0
+        self.up_sign = -1.0
+        self.orbit_frame = np.eye(3)
+        if box_axes is not None:
+            axes = validate_axes(box_axes).astype(np.float64)
+            # A box has no semantic "up". Choose the box axis nearest the
+            # previous world-Y convention to avoid arbitrary 90-degree flips.
+            up_index = int(np.argmax(np.abs(axes[1, :])))
+            up = axes[:, up_index].copy()
+            if up[1] < 0:
+                up *= -1
+            remaining = [i for i in range(3) if i != up_index]
+            right = axes[:, max(remaining, key=lambda i: abs(axes[0, i]))].copy()
+            if right[0] < 0:
+                right *= -1
+            self.orbit_frame = np.stack([right, up, np.cross(right, up)], axis=1)
 
     def reset(self) -> None:
         self.target = self.default_target.copy()
@@ -67,22 +81,26 @@ class OrbitCamera:
         self.azimuth = 0.0
         self.elevation = 0.3
         self.roll = 0.0
+        self.up_sign = -1.0
 
     def straighten(self) -> None:
         self.roll = 0.0
+        self.up_sign = -1.0
 
     def eye(self) -> np.ndarray:
         ce, se = np.cos(self.elevation), np.sin(self.elevation)
         ca, sa = np.cos(self.azimuth), np.sin(self.azimuth)
         offset = self.radius * np.array([ce * sa, se, ce * ca])
-        return self.target + offset
+        return self.target + self.orbit_frame @ offset
 
     def _axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         eye = self.eye()
-        world_up = np.array([0.0, self.up_sign, 0.0])
+        world_up = self.orbit_frame[:, 1] * self.up_sign
         z_axis = self.target - eye
         z_axis /= max(np.linalg.norm(z_axis), 1e-8)
-        x_axis = np.cross(world_up, z_axis)
+        # Camera pixels have downward-positive Y: project world-up toward
+        # negative image Y, with a right-handed camera rotation.
+        x_axis = np.cross(z_axis, world_up)
         x_axis /= max(np.linalg.norm(x_axis), 1e-8)
         y_axis = np.cross(z_axis, x_axis)
 
@@ -110,6 +128,11 @@ class OrbitCamera:
         shift = (-dx * x_axis + dy * y_axis) * self.radius * 0.001
         self.target += shift
 
+    def zoom(self, steps: float) -> None:
+        """Shared bracket-key zoom steps: positive in, negative out."""
+        base = 0.9 if steps >= 0 else 1.1
+        self.radius = float(np.clip(self.radius * base ** (abs(steps) * 0.25), 1e-3, 1e8))
+
 
 def make_K(width: int, height: int, fov_deg: float) -> np.ndarray:
     focal = 0.5 * height / np.tan(np.radians(fov_deg) / 2)
@@ -121,7 +144,7 @@ def make_K(width: int, height: int, fov_deg: float) -> np.ndarray:
 _HELP_LINES = [
     "drag LMB: orbit   drag MMB: pan   wheel: zoom",
     "[ / ]  or  -/+: zoom     u: flip up",
-    "z / c: roll     x: straighten (roll only)",
+    "z / c: roll     x: straighten to box",
     "r: full reset     h: toggle help     q/esc: quit",
     ", / .: splat size limit -/+ 0.1 (0 = off)",
 ]
@@ -215,6 +238,7 @@ def start_viewer(
     data = read_gsplat_glb(Path(glb)) if preview is None else None
     cam = None
     clip_bounds = None
+    final_box_applied = False
 
     interactive_scale = min(max(interactive_scale, 0.1), 1.0)
     render_w, render_h = width, height
@@ -253,7 +277,7 @@ def start_viewer(
             state["last"] = (x, y)
         elif event == cv2.EVENT_MOUSEWHEEL:
             delta = 1 if flags > 0 else -1
-            cam.radius = max(cam.radius * (0.9 ** delta), 1e-3)
+            cam.zoom(delta)
 
     if desktop:
         cv2.setMouseCallback(window, on_mouse)
@@ -274,13 +298,19 @@ def start_viewer(
                     raise error
                 updated = data is not None
             if updated:
-                if data.pop("_new_session", False):
+                new_session = data.pop("_new_session", False)
+                if new_session:
+                    final_box_applied = False
+                final_box = bool(data.get("clip_final", False)) or preview is None
+                if new_session or (final_box and not final_box_applied):
                     cam = None
                     clip_bounds = None
                     cached_view = None
                     state["dragging"] = None
                 if clip_bounds is None:
-                    if "clip_axes" in data and "clip_bounds" in data:
+                    if final_box and not bool(data.get("clip_final", False)):
+                        clip_bounds, clip_axes = fit_subject_box(data["means"].numpy())
+                    elif "clip_axes" in data and "clip_bounds" in data:
                         clip_bounds = validate_box(data["clip_bounds"])
                         clip_axes = validate_axes(data["clip_axes"])
                     else:
@@ -288,7 +318,9 @@ def start_viewer(
                         clip_bounds, clip_axes = estimate_oriented_box(data["means"].numpy())
                     # Apply once in the viewer, so existing files and live previews
                     # use the same crop without shrinking saved bounds repeatedly.
-                    clip_bounds = half_volume_box(clip_bounds)
+                    if not final_box:
+                        clip_bounds = half_volume_box(clip_bounds)
+                    final_box_applied = final_box
                 bounds_t = torch.from_numpy(clip_bounds)
                 local_means = data["means"] @ torch.from_numpy(clip_axes)
                 keep = ((local_means >= bounds_t[0]) & (local_means <= bounds_t[1])).all(dim=-1)
@@ -305,7 +337,7 @@ def start_viewer(
                     means_np = data["means"].numpy()
                     target = clip_bounds.mean(axis=0) @ clip_axes.T
                     radius = float(np.linalg.norm(clip_bounds[1] - clip_bounds[0])) * 0.9
-                    cam = OrbitCamera(target, radius)
+                    cam = OrbitCamera(target, radius, box_axes=clip_axes)
                 data = None
 
             if web is not None:
@@ -328,7 +360,7 @@ def start_viewer(
                     elif action == "pan":
                         cam.pan(dx, dy)
                     elif action == "zoom":
-                        cam.radius = float(np.clip(cam.radius * 0.9 ** dx, 1e-3, 1e8))
+                        cam.radius = float(np.clip(cam.radius * 0.9 ** (dx * 0.25), 1e-3, 1e8))
                     elif action == "reset":
                         cam.reset()
                     elif action == "flip":
@@ -400,9 +432,9 @@ def start_viewer(
                     scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
                     cached_view = None
             elif key in (ord("+"), ord("]")):
-                cam.radius *= 0.9
+                cam.zoom(1)
             elif key in (ord("-"), ord("[")):
-                cam.radius *= 1.1
+                cam.zoom(-1)
             elif key == ord("u"):
                 cam.up_sign *= -1
             elif key == ord("z"):
