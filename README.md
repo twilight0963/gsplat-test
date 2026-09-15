@@ -13,9 +13,9 @@ maximum width, output folder, brightness, contrast, and sharpness. Output must b
 a new folder inside `runs/`. Uploaded videos are retained in `runs/.uploads/`.
 The page shows upload progress followed by the latest engine stdout/stderr line.
 
-Clicking **Upload and build** reserves a waiting tab (to avoid popup blockers).
-It navigates to **http://localhost:8000/** when the training viewer is ready.
-If popups are blocked, use the **Open viewer** link. The viewer remains open after
+Clicking **Upload and build** keeps you on the upload page. A new tab opens at
+**http://localhost:8000/** only when the training viewer reports it is ready.
+Browsers may block delayed popups; if so, use the **Open viewer** link. The viewer remains open after
 export; closing a browser tab does not stop the process.
 
 The engine exits after training and export. The upload page then enables another
