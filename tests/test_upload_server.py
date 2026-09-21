@@ -2,8 +2,9 @@ import io
 import json
 import unittest
 import uuid
+from pathlib import Path
 from threading import Thread
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 from src.upload_server import Jobs, parameters, make_server
 
@@ -16,6 +17,21 @@ class UploadTests(unittest.TestCase):
         for query in ('steps=0', 'every=-1', 'sharpness=NaN', 'contrast=inf', 'output=../outside', 'output=runs'):
             with self.assertRaises(ValueError):
                 parameters(query)
+
+    def test_parameters_enable_persistent_viewer_flag(self):
+        p = parameters('output=runs/test-' + uuid.uuid4().hex)
+        self.assertIn('use-server', p)
+        self.assertIsNone(p['use-server'])
+
+    def test_jobs_launch_passes_boolean_flags_without_values(self):
+        jobs = Jobs()
+        process = Mock()
+        with patch('src.upload_server.subprocess.Popen', return_value=process) as popen, \
+             patch('src.upload_server.Thread'):
+            jobs.launch(Path('/tmp/input.video'), {'output': '/tmp/out', 'use-server': None})
+        command = popen.call_args.args[0]
+        self.assertIn('--use-server', command)
+        self.assertNotIn(None, command)
 
     def test_status_and_carriage_returns(self):
         jobs=Jobs()

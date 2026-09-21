@@ -1,5 +1,6 @@
 gsplat==1.5.3
 numpy==2.2.6
+Pillow==12.3.0
 opencv-python==5.0.0.93
 pycolmap==4.1.1
 scipy==1.15.3

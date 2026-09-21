@@ -50,7 +50,7 @@ class LiveViewerTests(unittest.TestCase):
              patch.object(engine,'train_splats',return_value={}), \
              patch.object(engine,'export_gltf') as export:
             output=Path(tmp)
-            result=engine.build_model(Path('input.mp4'),output)
+            result=engine.build_model(Path('input.mp4'),output,use_server=True)
             self.assertEqual(result,output/'model.glb')
             export.assert_called_once_with({},result)
             ensure.assert_called_once()

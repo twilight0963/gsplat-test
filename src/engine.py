@@ -8,6 +8,7 @@ from pathlib import Path
 from time import monotonic
 
 import os
+import sys
 import cv2
 import numpy as np
 import pycolmap
@@ -15,10 +16,12 @@ import torch
 import torch.nn.functional as F
 from gsplat import rasterization
 from src.clip_box import estimate_oriented_box, fit_subject_box
-from src.gsplat_viewer import TrainingPreview
+from src.gsplat_viewer import TrainingPreview, start_viewer
 from src.live_viewer import PreviewPublisher, ensure_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
+from src.image_dataset import ImageDataset, prepare_image_dataset
+from src.run_benchmark import benchmark_run, frame_counts, stage, timed
 
 def unsharp_mask(frame, amount=1.5, sigma=1.0, threshold=0):
     blurred = cv2.GaussianBlur(frame, (0, 0), sigma)
@@ -28,7 +31,9 @@ def unsharp_mask(frame, amount=1.5, sigma=1.0, threshold=0):
         np.copyto(sharpened, frame, where=low_contrast_mask)
     return sharpened
 
-def extract_frames(video: Path, output: Path, every: int, max_width: int, brightness: float=1, contrast: float=1, sharpness: float=0.5) -> Path:
+@timed('input_preparation')
+def extract_frames(video: Path, output: Path, every: int, max_width: int, brightness: float=1, contrast: float=1, sharpness: float=0.5, *, original_only: bool = False,
+                   unsharp: bool = True) -> Path:
     if every < 1:
         raise ValueError("--every must be at least 1")
     output.mkdir(parents=True, exist_ok=True)
@@ -52,82 +57,150 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int, bright
                     interpolation=cv2.INTER_AREA,
                 )
 
-            frame = cv2.addWeighted(
-                frame,
-                contrast,
-                np.zeros(frame.shape, frame.dtype),
-                0,
-                brightness
-            )
-            frame = unsharp_mask(frame, amount=1.2, sigma=1.0)
+            if not original_only:
+                with stage('preprocessing'):
+                    frame = cv2.addWeighted(frame, contrast, np.zeros_like(frame), 0, brightness)
+                    if unsharp:
+                        frame = unsharp_mask(frame, amount=1.2, sigma=1.0)
             path = output / f"frame_{len(frames):06d}.jpg"
             if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
                 raise RuntimeError(f"Could not write frame: {path}")
             frames.append(path)
         index += 1
     reader.release()
+    frame_counts(decoded_video_frames=index, frames_before_colmap=len(frames))
 
-    sharp_output_path = (output / "sharpened")
-    sharp_output_path.mkdir(parents=True, exist_ok=True)
-    src_dst_pairs = []
-    output_paths: list[Path] = []
-    for frame in frames:
-        out_path = sharp_output_path / frame.name.replace(".jpg", "_sharpened.jpg")
-        output_paths.append(out_path)
-        src_dst_pairs.extend([str(frame), str(out_path)])
-    print(src_dst_pairs)
-    for i in range(0,len(src_dst_pairs),118):
-        if os.name == 'nt':
-            _run([
-                "FidelityFX_CLI.exe", "-Mode", "CAS", "-Sharpness", str(sharpness),
-                *src_dst_pairs[i:i+118]
-            ])
-        else:
-            _run([
-                "wine", "FidelityFX_CLI.exe", "-Mode", "CAS", "-Sharpness", str(sharpness),
-                *src_dst_pairs[i:i+118]
-            ])
-    if len(output_paths) < 2:
+    if len(frames) < 2:
         raise RuntimeError("The video did not produce at least two usable frames")
-    (sharp_output_path / "capture.json").write_text(
+    if original_only:
+        return output
+    output_paths = apply_cas(frames, output / "sharpened", sharpness)
+    (output_paths[0].parent / "capture.json").write_text(
         json.dumps({"fps": fps, "frames": [p.name for p in output_paths]}, indent=2) + "\n"
     )
-    return sharp_output_path
+    return output_paths[0].parent
+
+
+@timed('cas')
+def apply_cas(images: list[Path], output: Path, sharpness: float) -> list[Path]:
+    """Use lossless output and retain the exact input order for camera pairing."""
+    output.mkdir(parents=True, exist_ok=True)
+    targets = [output / f"frame_{i:06d}.png" for i in range(len(images))]
+    executable = Path(__file__).resolve().parent.parent / "FidelityFX_CLI.exe"
+    prefix = [] if os.name == "nt" else ["wine"]
+    for start in range(0, len(images), 59):
+        pairs = [str(p.resolve()) for pair in zip(images[start:start+59], targets[start:start+59]) for p in pair]
+        _run([*prefix, str(executable), "-Mode", "CAS", "-Sharpness", str(sharpness), *pairs])
+    for source, target in zip(images, targets):
+        src = cv2.imread(str(source))
+        dst = cv2.imread(str(target))
+        if src is None or dst is None or src.shape != dst.shape:
+            raise RuntimeError(f"CAS did not produce a matching image: {target}")
+    return targets
+
+
+@timed('preprocessing')
+def prepare_sr_targets(images: list[Path], output: Path, width: int, height: int,
+                       brightness: float, contrast: float, sharpness: float,
+                       unsharp: bool, root: Path, checkpoint: Path, tile: int,
+                       device: str) -> tuple[list[Path], list[Path]]:
+    base_dir = output / "base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    base = []
+    for i, path in enumerate(images):
+        frame = cv2.imread(str(path))
+        if frame is None or frame.shape[:2] != (height, width):
+            raise ValueError(f"SR requires matching undistorted image dimensions: {path}")
+        frame = cv2.addWeighted(frame, contrast, np.zeros_like(frame), 0, brightness)
+        target = base_dir / f"frame_{i:06d}.png"
+        if not cv2.imwrite(str(target), frame):
+            raise RuntimeError(f"Could not write {target}")
+        base.append(target)
+    manifest = output / "inputs.json"
+    manifest.write_text(json.dumps([str(p.resolve()) for p in base]))
+    enhanced = output / "enhanced"
+    print("Generating tiled SwinIR 2x training targets...", flush=True)
+    # A separate process releases the entire SR CUDA context before training starts.
+    with stage('super_resolution'):
+        _run([sys.executable, "-u", "-m", "src.super_resolution",
+              "--root", str(root.resolve()), "--checkpoint", str(checkpoint.resolve()),
+              "--manifest", str(manifest.resolve()), "--output", str(enhanced.resolve()),
+              "--tile", str(tile), "--device", device])
+    targets = [enhanced / p.name for p in base]
+    for path in targets:
+        frame = cv2.imread(str(path))
+        if frame is None or frame.shape[:2] != (height * 2, width * 2):
+            raise RuntimeError(f"SwinIR did not produce a matching 2x image: {path}")
+        if unsharp:
+            if not cv2.imwrite(str(path), unsharp_mask(frame, amount=1.2)):
+                raise RuntimeError(f"Could not write {path}")
+    print("Applying CAS to super-resolution targets...", flush=True)
+    return apply_cas(targets, output / "cas", sharpness), base
+
+
+def sr_training_loss(rendered: torch.Tensor, enhanced: torch.Tensor,
+                     base: torch.Tensor, prior_weight: float) -> torch.Tensor:
+    """SRGS-inspired L1 objective; base targets deliberately exclude sharpening."""
+    downsampled = F.interpolate(rendered.permute(0, 3, 1, 2).float(),
+                               size=base.shape[1:3], mode="area").permute(0, 2, 3, 1)
+    return (prior_weight * F.l1_loss(rendered, enhanced)
+            + (1 - prior_weight) * F.l1_loss(downsampled, base))
 
 
 def _run(command: list[str]) -> None:
     try:
         subprocess.run(command, check=True)
     except FileNotFoundError as exc:
-        raise RuntimeError("COLMAP is required and must be on PATH.") from exc
+        raise RuntimeError(f"Required executable not found: {command[0]}") from exc
 
 
+@timed('colmap')
 def run_colmap(
     capture: Path, workdir: Path, vocab_tree: Path | None,
+    *, photo_dataset: ImageDataset | None = None,
+    image_matching: str = 'auto', spatial_neighbors: int = 20,
 ) -> Path:
     database = workdir / "database.db"
     sparse = workdir / "sparse"
     sparse.mkdir(parents=True, exist_ok=True)
 
-    _run([
+    feature_command = [
         "colmap", "feature_extractor",
         "--database_path", str(database),
         "--image_path", str(capture),
-        "--ImageReader.single_camera", "1",
+        "--ImageReader.single_camera", str(int(photo_dataset.single_camera)) if photo_dataset else "1",
         "--FeatureExtraction.use_gpu", "1"
-    ])
+    ]
+    if photo_dataset:
+        feature_command += ['--FeatureExtraction.max_image_size', str(photo_dataset.max_image_size)]
+        if photo_dataset.camera_params:
+            feature_command += ['--ImageReader.camera_model', 'SIMPLE_RADIAL',
+                                '--ImageReader.camera_params', photo_dataset.camera_params]
+    _run(feature_command)
 
+    spatial = photo_dataset is not None and photo_dataset.spatial and image_matching == 'auto'
     match_command = [
         "colmap", "sequential_matcher",
         "--database_path", str(database),
-        "--SequentialMatching.overlap", "30",
+        "--SequentialMatching.overlap", "10" if spatial else "30",
     ]
     if vocab_tree is not None:
         match_command += [
             "--SequentialMatching.loop_detection", "1",
             "--SequentialMatching.vocab_tree_path", str(vocab_tree),
         ]
-    _run(match_command)
+    if photo_dataset and not spatial:
+        print('Matching photos exhaustively (GPS unavailable or exhaustive mode selected)...', flush=True)
+        _run(['colmap', 'exhaustive_matcher', '--database_path', str(database)])
+    else:
+        _run(match_command)
+        if spatial:
+            print(f'Matching GPS neighbors ({spatial_neighbors} per image) plus capture-order neighbors...', flush=True)
+            _run(['colmap', 'spatial_matcher', '--database_path', str(database),
+                  '--SpatialMatching.max_num_neighbors', str(spatial_neighbors),
+                  '--SpatialMatching.min_num_neighbors', str(min(5, spatial_neighbors)),
+                  '--SpatialMatching.max_distance', '100',
+                  '--SpatialMatching.ignore_z', '1'])
 
     _run([
         "colmap", "view_graph_calibrator",
@@ -153,13 +226,16 @@ def run_colmap(
         )
 
     undistorted = workdir / "undistorted"
-    _run([
+    undistort_command = [
         "colmap", "image_undistorter",
         "--image_path", str(capture),
         "--input_path", str(models[0]),
         "--output_path", str(undistorted),
         "--output_type", "COLMAP",
-    ])
+    ]
+    if photo_dataset:
+        undistort_command += ['--max_image_size', str(photo_dataset.max_image_size)]
+    _run(undistort_command)
     return undistorted
 
 
@@ -170,6 +246,7 @@ def _subsample(means: np.ndarray, colors: np.ndarray, max_points: int) -> tuple[
     return means[keep], colors[keep]
 
 
+@timed('reconstruction_loading')
 def load_reconstruction(
     undistorted: Path, max_points: int
 ) -> tuple[dict[str, torch.Tensor], list[Path], int, int]:
@@ -194,11 +271,13 @@ def load_reconstruction(
         if not frame.exists():
             continue
 
+        loaded = cv2.imread(str(frame))
+        if loaded is None:
+            raise RuntimeError(f'Could not read undistorted image: {frame}')
         if width == 0:
-            loaded = cv2.imread(str(frame))
-            if loaded is None:
-                continue
             height, width = loaded.shape[:2]
+        elif loaded.shape[:2] != (height, width):
+            raise ValueError('Undistorted images have different dimensions; use a consistent camera dataset')
 
         mat = np.asarray(image.cam_from_world().matrix(), dtype=np.float32)
         if mat.shape == (3, 4):
@@ -206,11 +285,7 @@ def load_reconstruction(
         viewmats.append(mat)
 
         camera = reconstruction.cameras[image.camera_id]
-        params = np.asarray(camera.params, dtype=np.float32)
-        fx, fy, cx, cy = params[:4]
-        intrinsics.append(
-            np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-        )
+        intrinsics.append(np.asarray(camera.calibration_matrix(), dtype=np.float32))
         images.append(frame)
 
     if not images:
@@ -272,6 +347,7 @@ def _reset_opacities(
                         state["exp_avg_sq"].zero_()
 
 
+@timed('training')
 def train_splats(
     data: dict[str, torch.Tensor],
     images: list[Path],
@@ -287,6 +363,8 @@ def train_splats(
     opacity_reset_interval: int = 3000,
     mixed_precision: bool = True,
     preview: TrainingPreview | PreviewPublisher | None = None,
+    base_images: list[Path] | None = None,
+    sr_prior_weight: float = 0.5,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -302,7 +380,14 @@ def train_splats(
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    target_all = _load_targets_parallel(images).pin_memory()
+    if not 0 <= sr_prior_weight <= 1:
+        raise ValueError("SR prior weight must be between 0 and 1")
+    if base_images is not None and len(base_images) != len(images):
+        raise ValueError("SR base and enhanced targets must have matching view counts")
+    # SR images stay on disk; transfer only the current camera batch to the GPU.
+    target_all = None if base_images is not None else _load_targets_parallel(images)
+    if target_all is not None and device == "cuda":
+        target_all = target_all.pin_memory()
 
     means = data["means"].to(device).requires_grad_()
     colors_init = data["colors"].numpy()
@@ -332,7 +417,7 @@ def train_splats(
 
     viewmats_all = data["viewmats"].to(device)
     Ks_all = data["Ks"].to(device)
-    num_views = target_all.shape[0]
+    num_views = len(images) if base_images is not None else target_all.shape[0]
     optimizer = torch.optim.Adam([
         {"params": [means], "lr": means_lr_init, "name": "means"},
         {"params": [colors], "lr": 2.5e-3, "name": "colors"},
@@ -390,7 +475,15 @@ def train_splats(
         idx = perm[cursor : cursor + view_batch_size]
         cursor += view_batch_size
 
-        target = target_all[idx.cpu()].to(device, non_blocking=True).float() / 255.0
+        if base_images is None:
+            target = target_all[idx.cpu()].to(device, non_blocking=True).float() / 255.0
+            base_target = None
+        else:
+            selected = idx.cpu().tolist()
+            target = _load_targets_parallel([images[i] for i in selected]).to(device).float() / 255.0
+            base_target = _load_targets_parallel([base_images[i] for i in selected]).to(device).float() / 255.0
+            if target.shape[1:3] != (height, width) or base_target.shape[1:3] != (height // 2, width // 2):
+                raise ValueError("SR target dimensions do not match the render cameras")
         viewmats = viewmats_all[idx]
         Ks = Ks_all[idx]
 
@@ -407,7 +500,8 @@ def train_splats(
                 means, quats_n, scales_c.exp(), opacities.sigmoid(), colors.sigmoid(),
                 viewmats, Ks, width, height, packed=True,
             )
-            loss = torch.abs(rendered - target).mean()
+            loss = (torch.abs(rendered - target).mean() if base_target is None else
+                    sr_training_loss(rendered, target, base_target, sr_prior_weight))
         if quality_config.scale_regularization:
             loss = loss + quality_config.scale_regularization * _scale_regularizer(
                 scales, quality_config.max_axis_ratio
@@ -463,6 +557,7 @@ def train_splats(
     return result
 
 
+@timed('export')
 def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     means = result["means"].numpy().astype(np.float32)
     colors = result["colors"].numpy().astype(np.float32)
@@ -475,6 +570,7 @@ def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
                      clip_final=bool(result.get("clip_final", False)))
 
 
+@benchmark_run
 def build_model(
     video: Path,
     output: Path,
@@ -482,7 +578,7 @@ def build_model(
     max_width: int = 1920,
     steps: int = 5000,
     device: str = "cuda",
-    view_batch_size: int = 4,
+    view_batch_size: int | None = None,
     max_points: int = 150_000,
     vocab_tree: Path | None = None,
     voxel_guided: bool = True,
@@ -493,24 +589,102 @@ def build_model(
     mixed_precision: bool = True,
     brightness: float = 1.0,
     contrast: float = 1.0,
-    sharpness: float = 0.5
+    sharpness: float = 0.5,
+    super_resolution: bool = False,
+    swinir_root: Path | None = None,
+    sr_checkpoint: Path | None = None,
+    sr_tile: int = 128,
+    sr_prior_weight: float = 0.5,
+    unsharp: bool | None = None,
+    use_server: bool = False,
+    image_matching: str = 'auto',
+    spatial_neighbors: int = 20,
 ) -> Path:
-    print("Extracting and sharpening video frames...", flush=True)
-    capture_dir = output / "capture"
-    extract_frames(video, capture_dir, every, max_width, brightness, contrast, sharpness)
-    undistorted = run_colmap(capture_dir, output / "colmap", vocab_tree)
-    print("Loading reconstructions...")
+    if image_matching not in ('auto', 'exhaustive') or spatial_neighbors < 1:
+        raise ValueError('Invalid image matching mode or spatial neighbor count')
+    if not np.isfinite([brightness, contrast, sharpness, sr_prior_weight]).all():
+        raise ValueError("Image controls and SR weight must be finite")
+    if not 0 <= sharpness <= 1 or not 0 <= sr_prior_weight <= 1:
+        raise ValueError("Sharpness and SR prior weight must be between 0 and 1")
+    if super_resolution:
+        from src.super_resolution import validate_setup
+        validate_setup(swinir_root, sr_checkpoint, sr_tile)
+    if view_batch_size is None:
+        view_batch_size = 1 if super_resolution else 4
+    if unsharp is None:
+        unsharp = not super_resolution
+    photo_dataset = None
+    if video.is_dir():
+        print('Importing photos and metadata...', flush=True)
+        with stage('input_preparation'):
+            photo_dataset = prepare_image_dataset(video, output, max_width)
+        frame_counts(frames_before_colmap=photo_dataset.count)
+        undistorted = run_colmap(photo_dataset.capture, output / 'colmap', vocab_tree,
+                                photo_dataset=photo_dataset, image_matching=image_matching,
+                                spatial_neighbors=spatial_neighbors)
+    else:
+        print("Extracting video frames...", flush=True)
+        capture_dir = output / "capture" / "originals"
+        capture = extract_frames(video, capture_dir, every, max_width, brightness, contrast,
+                                 sharpness, original_only=True, unsharp=False)
+        undistorted = run_colmap(capture, output / "colmap", vocab_tree)
+    print("Loading reconstructions...", flush=True)
     data, images, width, height = load_reconstruction(undistorted, max_points)
+    frame_counts(frames_after_colmap=len(images))
+    base_images = None
+    if super_resolution:
+        images, base_images = prepare_sr_targets(
+            images, output / "sr", width, height, brightness, contrast, sharpness,
+            unsharp, swinir_root, sr_checkpoint, sr_tile, device)
+        data["Ks"] = data["Ks"].clone()
+        data["Ks"][:, :2, :] *= 2
+        width, height = width * 2, height * 2
+    else:
+        # Keep originals and metadata intact for SfM; enhance only training targets.
+        print('Preprocessing registered images (brightness/contrast, unsharp and CAS)...', flush=True)
+        target_dir = output / 'training_targets'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        targets = []
+        for i, path in enumerate(images):
+            with stage('preprocessing'):
+                frame = cv2.imread(str(path))
+                if frame is None:
+                    raise RuntimeError(f'Could not read image: {path}')
+                frame = cv2.addWeighted(frame, contrast, np.zeros_like(frame), 0, brightness)
+                if unsharp:
+                    frame = unsharp_mask(frame, amount=1.2)
+                target = target_dir / f'frame_{i:06d}.png'
+                if not cv2.imwrite(str(target), frame):
+                    raise RuntimeError(f'Could not write image: {target}')
+                targets.append(target)
+        images = apply_cas(targets, output / 'training_cas', sharpness)
     print("Training splats...")
     glb_path = output / "model.glb"
-    preview = PreviewPublisher(Path(__file__).resolve().parent.parent / "runs" / ".viewer")
+    preview = (PreviewPublisher(Path(__file__).resolve().parent.parent / "runs" / ".viewer")
+               if use_server else TrainingPreview())
+    viewer_thread = None
     try:
-        ensure_viewer(preview.directory, width, height)
+        if use_server:
+            with stage('viewer_startup'):
+                ensure_viewer(preview.directory, width, height)
+        else:
+            # Keep direct engine runs self-contained: the desktop window consumes
+            # the same live snapshots while training continues in this thread.
+            import threading
+            viewer_thread = threading.Thread(
+                target=start_viewer,
+                args=(None, width, height),
+                kwargs={"preview": preview, "desktop": True},
+                daemon=True,
+            )
+            with stage('viewer_startup'):
+                viewer_thread.start()
         result = train_splats(
             data, images, width, height, steps, device, view_batch_size,
             voxel_guided, voxel_config,
             means_lr_init, means_lr_final_ratio,
             opacity_reset_interval, mixed_precision, preview=preview,
+            base_images=base_images, sr_prior_weight=sr_prior_weight,
         )
         print("Exporting model...", flush=True)
         export_gltf(result, glb_path)
@@ -521,20 +695,27 @@ def build_model(
         raise
     finally:
         preview.close()
+        if viewer_thread is not None:
+            viewer_thread.join(timeout=2)
     return glb_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a Gaussian splat model from a drone video."
+        description="Build a Gaussian splat model from a drone video or image directory."
     )
-    parser.add_argument("video", type=Path)
+    parser.add_argument("video", type=Path, metavar='INPUT', help='Video file or directory of photos (non-recursive).')
     parser.add_argument("--output", type=Path, default=Path("runs/gsplat"))
-    parser.add_argument("--every", type=int, default=5, help="Keep every Nth video frame.")
+    parser.add_argument("--every", type=int, default=5, help="Keep every Nth video frame; image directories use all photos.")
+    parser.add_argument('--image-matching', choices=('auto', 'exhaustive'), default='auto',
+                        help='Photos: GPS + sequential matching when all images have GPS, otherwise exhaustive.')
+    parser.add_argument('--spatial-neighbors', type=int, default=20,
+                        help='GPS nearest neighbors per photo in auto mode (default: 20).')
     parser.add_argument("--max-width", type=int, default=1920)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--view-batch-size", type=int, default=4)
+    parser.add_argument("--view-batch-size", type=int, default=None,
+                        help="Defaults to 1 with SR, otherwise 4.")
     parser.add_argument("--max-points", type=int, default=200_000)
     parser.add_argument("--max-gaussians", type=int, default=200_000)
     parser.add_argument("--max-axis-ratio", type=float, default=10.0,
@@ -592,6 +773,22 @@ def main() -> None:
     parser.add_argument(
         "--sharpness",type=float, default=0.5
     )
+    parser.add_argument("--super-resolution", action="store_true",
+                        help="Use tiled SwinIR 2x, CAS and dual-resolution supervision.")
+    default_root = Path(__file__).resolve().parent.parent
+    parser.add_argument("--swinir-root", type=Path,
+                        default=default_root / "third_party" / "SwinIR",
+                        help="Official SwinIR source checkout (same default as upload_server).")
+    parser.add_argument("--sr-checkpoint", type=Path,
+                        default=default_root / "weights" / "swinir-lightweight-x2.pth",
+                        help="SwinIR-S lightweight 2x checkpoint (same default as upload_server).")
+    parser.add_argument("--sr-tile", type=int, default=128, help="Input tile size, multiple of 8, >= 32.")
+    parser.add_argument("--sr-prior-weight", type=float, default=0.5,
+                        help="Enhanced target weight; remaining weight anchors to base images.")
+    parser.add_argument("--unsharp", action=argparse.BooleanOptionalAction, default=None,
+                        help="Unsharp masking: defaults off with SR, on otherwise.")
+    parser.add_argument("--use-server", action="store_true",
+                        help="Use the persistent browser viewer (used by upload_server).")
     args = parser.parse_args()
     voxel_config = VoxelGuidedConfig(
         n_along_shortest=args.voxel_n,
@@ -622,7 +819,13 @@ def main() -> None:
             args.mixed_precision,
             args.brightness,
             args.contrast,
-            args.sharpness
+            args.sharpness,
+            super_resolution=args.super_resolution,
+            swinir_root=args.swinir_root, sr_checkpoint=args.sr_checkpoint,
+            sr_tile=args.sr_tile, sr_prior_weight=args.sr_prior_weight,
+            unsharp=args.unsharp,
+            use_server=args.use_server,
+            image_matching=args.image_matching, spatial_neighbors=args.spatial_neighbors,
         ),
         flush=True
     )

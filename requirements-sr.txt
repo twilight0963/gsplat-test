@@ -1,0 +1,2 @@
+# Optional SwinIR architecture dependency; install after requirements.txt.
+timm==1.0.15

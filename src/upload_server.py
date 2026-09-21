@@ -15,8 +15,10 @@ import socket
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def parameters(query):
+def parameters(query, swinir_root=None, sr_checkpoint=None):
     values = parse_qs(query, strict_parsing=True)
+    if any(len(items) != 1 for items in values.values()):
+        raise ValueError('Duplicate upload parameters are not allowed')
     result = {}
     for name, default, lower, upper, kind in (
         ('steps', '2000', 1, 1000000, int), ('every', '5', 1, 100000, int),
@@ -27,6 +29,30 @@ def parameters(query):
         if not math.isfinite(value) or not lower <= value <= upper:
             raise ValueError(f'Invalid {name}: expected {lower} to {upper}')
         result[name] = str(value)
+    sr = values.get('super-resolution', ['false'])[0]
+    if sr not in ('true', 'false'):
+        raise ValueError('Invalid super-resolution: expected true or false')
+    unsharp = values.get('unsharp', ['auto'])[0]
+    if unsharp not in ('auto', 'on', 'off'):
+        raise ValueError('Invalid unsharp: expected auto, on or off')
+    if unsharp != 'auto':
+        result['unsharp' if unsharp == 'on' else 'no-unsharp'] = None
+    if sr == 'true':
+        tile = int(values.get('sr-tile', ['128'])[0])
+        if tile < 32 or tile > 512 or tile % 8:
+            raise ValueError('SR tile size must be a multiple of 8 between 32 and 512')
+        weight = float(values.get('sr-prior-weight', ['0.5'])[0])
+        if not math.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError('SR prior weight must be between 0 and 1')
+        # These executable-source paths are configured by the server operator,
+        # never taken from the browser request.
+        root = Path(swinir_root) if swinir_root is not None else ROOT / 'third_party/SwinIR'
+        checkpoint = Path(sr_checkpoint) if sr_checkpoint is not None else ROOT / 'weights/swinir-lightweight-x2.pth'
+        if not (root / 'models/network_swinir.py').is_file() or not checkpoint.is_file():
+            raise ValueError('Super-resolution is not configured. Install SwinIR and its 2x weights on the server; see README.md.')
+        result.update({'super-resolution': None, 'swinir-root': str(root.resolve()),
+                       'sr-checkpoint': str(checkpoint.resolve()), 'sr-tile': str(tile),
+                       'sr-prior-weight': str(weight)})
     output = values.get('output', ['runs/web-' + uuid.uuid4().hex[:8]])[0]
     path = (ROOT / output).resolve()
     if not path.is_relative_to(ROOT / 'runs') or path == ROOT / 'runs':
@@ -34,6 +60,9 @@ def parameters(query):
     if path.exists():
         raise ValueError('Output folder already exists; choose a new name')
     result['output'] = str(path)
+    # Uploaded jobs always use the persistent browser viewer. This is fixed by
+    # the server and cannot be overridden by request parameters.
+    result['use-server'] = None
     return result
 
 
@@ -60,7 +89,9 @@ class Jobs:
     def launch(self, video, params):
         command = [sys.executable, '-u', '-m', 'src.engine', str(video)]
         for key, value in params.items():
-            command.extend(['--' + key, value])
+            command.append('--' + key)
+            if value is not None:
+                command.append(value)
         self.process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
         Thread(target=self.monitor, daemon=True).start()
@@ -99,7 +130,7 @@ class Jobs:
                 self.process.wait()
 
 
-def make_server(host, port, jobs):
+def make_server(host, port, jobs, *, swinir_root=None, sr_checkpoint=None):
     page = Path(__file__).with_name('upload.html').read_bytes()
 
     class Handler(BaseHTTPRequestHandler):
@@ -131,7 +162,7 @@ def make_server(host, port, jobs):
             reserved = False
             video = None
             try:
-                params = parameters(url.query)
+                params = parameters(url.query, swinir_root, sr_checkpoint)
                 length = int(self.headers.get('Content-Length', '0'))
                 if not 0 < length <= 20 * 1024 ** 3:
                     raise ValueError('Upload must be between 1 byte and 20 GiB')
@@ -167,11 +198,16 @@ def main():
     parser = argparse.ArgumentParser(description='Upload a drone video and build a model in your browser')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8001)
+    parser.add_argument('--swinir-root', type=Path, default=ROOT / 'third_party/SwinIR',
+                        help='Official SwinIR source checkout for browser SR jobs')
+    parser.add_argument('--sr-checkpoint', type=Path, default=ROOT / 'weights/swinir-lightweight-x2.pth',
+                        help='Pretrained SwinIR-S lightweight 2x checkpoint')
     args = parser.parse_args()
     if args.port == 8000:
         parser.error('Port 8000 is reserved for the viewer; use 8001 for uploads')
     jobs = Jobs()
-    server = make_server(args.host, args.port, jobs)
+    server = make_server(args.host, args.port, jobs,
+                         swinir_root=args.swinir_root, sr_checkpoint=args.sr_checkpoint)
     print(f'Upload interface: http://localhost:{server.server_port}/', flush=True)
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:

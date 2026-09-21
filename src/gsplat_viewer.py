@@ -228,12 +228,17 @@ def start_viewer(
     port: int = 8000,
     desktop: bool = False,
     size_clamp_multiplier: float = 1.0,
+    bounding_box: bool = True,
 ) -> None:
     if not math.isfinite(size_clamp_multiplier) or not 0 <= size_clamp_multiplier <= 1000:
         raise ValueError("Size clamp multiplier must be between 0 and 1000")
     if not torch.cuda.is_available():
         raise RuntimeError("This viewer needs a CUDA GPU (gsplat's rasterizer is CUDA-only).")
     device = "cuda"
+    def clamp_scales(scales, positions, bounds, multiplier):
+        if bounding_box:
+            return _clamp_at_box_edges(scales, positions, bounds, multiplier)
+        return _clamp_scale_outliers(scales, multiplier)
     torch.backends.cudnn.benchmark = True
     data = read_gsplat_glb(Path(glb)) if preview is None else None
     cam = None
@@ -324,13 +329,15 @@ def start_viewer(
                 bounds_t = torch.from_numpy(clip_bounds)
                 local_means = data["means"] @ torch.from_numpy(clip_axes)
                 keep = ((local_means >= bounds_t[0]) & (local_means <= bounds_t[1])).all(dim=-1)
+                if not bounding_box:
+                    keep = torch.ones_like(keep)
                 data = {key: value[keep] if key in ("means", "quats", "scales", "opacities", "colors") else value
                         for key, value in data.items()}
                 means = data["means"].to(device)
                 quats = data["quats"].to(device)
                 source_scales = data["scales"]
                 source_positions = local_means[keep]
-                scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
+                scales = clamp_scales(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
                 opacities = data["opacities"].to(device)
                 colors = data["colors"].to(device)
                 if cam is None and len(data["means"]):
@@ -349,7 +356,7 @@ def start_viewer(
                     if action == "size_clamp":
                         size_clamp_multiplier = dx
                         if source_scales is not None:
-                            scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
+                            scales = clamp_scales(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
                             cached_view = None
                         continue
                     if cam is None:
@@ -393,10 +400,11 @@ def start_viewer(
                 if fast:
                     frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
                 # Mask after resizing too, so interpolation cannot bleed past the boundary.
-                K_display = make_K(width, height, fov)
-                clip_view = box_view(view, clip_axes)
-                frame_bgr[~box_mask(clip_bounds, clip_view, K_display, width, height)] = 0
-                draw_box(frame_bgr, clip_bounds, clip_view, K_display)
+                if bounding_box:
+                    K_display = make_K(width, height, fov)
+                    clip_view = box_view(view, clip_axes)
+                    frame_bgr[~box_mask(clip_bounds, clip_view, K_display, width, height)] = 0
+                    draw_box(frame_bgr, clip_bounds, clip_view, K_display)
                 cached_view = view.copy()
             cached_size = size
             if redraw or status != cached_status or state["show_help"] != cached_help:
@@ -406,7 +414,7 @@ def start_viewer(
                     cv2.putText(display, status, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 if desktop:
-                    limit_text = f"Edge size limit: {size_clamp_multiplier:.1f}"
+                    limit_text = f"{'Edge size' if bounding_box else 'Size'} limit: {size_clamp_multiplier:.1f}"
                     if size_clamp_multiplier == 0:
                         limit_text += " (off)"
                     cv2.putText(display, limit_text, (8, max(18, height - 46)),
@@ -429,7 +437,7 @@ def start_viewer(
                 delta = 0.1 if key == ord(".") else -0.1
                 size_clamp_multiplier = min(1000., max(0., round(size_clamp_multiplier + delta, 1)))
                 if source_scales is not None:
-                    scales = _clamp_at_box_edges(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
+                    scales = clamp_scales(source_scales, source_positions, bounds_t, size_clamp_multiplier).to(device)
                     cached_view = None
             elif key in (ord("+"), ord("]")):
                 cam.zoom(1)
@@ -465,7 +473,10 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--desktop", action="store_true", help="Use the original OpenCV window")
-    parser.add_argument("--size-clamp-multiplier", type=float, default=1.0,
+    parser.add_argument("--no-bounding-box", action="store_true",
+                        help="Render all splats without box clipping or outline; retain camera alignment.")
+    parser.add_argument("--size-clamp-multiplier", type=float, default=0.0,
                         help="Multiply the size cutoff; higher permits larger splats, 0 disables clamping")
     args = parser.parse_args()
-    start_viewer(args.model_path, host=args.host, port=args.port, desktop=args.desktop, size_clamp_multiplier=args.size_clamp_multiplier)
+    start_viewer(args.model_path, host=args.host, port=args.port, desktop=args.desktop,
+                 size_clamp_multiplier=args.size_clamp_multiplier, bounding_box=not args.no_bounding_box)
