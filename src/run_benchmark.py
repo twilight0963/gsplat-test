@@ -11,7 +11,7 @@ from time import perf_counter
 
 _active = ContextVar('run_benchmark', default=None)
 STAGES = ('input_preparation', 'preprocessing', 'cas', 'super_resolution',
-          'colmap', 'reconstruction_loading', 'viewer_startup', 'training', 'export')
+          'keyframe_selection', 'colmap', 'reconstruction_loading', 'viewer_startup', 'training', 'export')
 
 
 @contextmanager
@@ -32,6 +32,19 @@ def stage(name):
             run['stack'][-1][1] += elapsed
 
 
+@contextmanager
+def colmap_command(name):
+    """Inclusive command subtotals; these do not alter exclusive stage accounting."""
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        run = _active.get()
+        if run is not None:
+            detail = run.setdefault('colmap_seconds', {})
+            detail[name] = detail.get(name, 0.) + perf_counter() - started
+
+
 def timed(name):
     def decorate(function):
         @wraps(function)
@@ -46,6 +59,12 @@ def frame_counts(**counts):
     run = _active.get()
     if run is not None:
         run['counts'].update(counts)
+
+
+def metrics(**values):
+    run = _active.get()
+    if run is not None:
+        run.setdefault('quality', {}).update(values)
 
 
 def benchmark_run(function):
@@ -74,12 +93,21 @@ def benchmark_run(function):
             'input_type': 'images' if Path(options['video']).is_dir() else 'video',
             'model': str(result), 'frame_counts': run['counts'],
             'total_seconds': total, 'stage_seconds': seconds,
+            'colmap_command_seconds': run.get('colmap_seconds', {}),
+            'quality': run.get('quality', {}),
+            'runtime_target_seconds': 600,
+            'runtime_target_met': total <= 600,
+            'absolute_accuracy': {'status': 'unverified', 'target_meters': 1,
+                                  'reason': 'No geographic alignment and independent checkpoints evaluated.'},
             'preprocessing_total_seconds': preprocessing,
             'other_seconds': max(0.0, total - sum(seconds.values())),
             'settings': {key: options[key] for key in ('steps', 'every', 'max_width', 'device',
                 'super_resolution', 'sr_tile', 'sr_prior_weight', 'sharpness', 'brightness',
-                'contrast', 'image_matching', 'spatial_neighbors', 'use_server')},
+                'contrast', 'image_matching', 'spatial_neighbors', 'use_server', 'keyframe_max_gap', 'keyframe_motion',
+                'sequential_overlap', 'max_features', 'gp_iterations', 'ba_iterations', 'colmap_cache', 'photo_every', 'headless',
+                'mapper_tracks_per_view', 'eval_every', 'ssim_weight', 'scale_means_lr')},
         }
+        report['settings']['vocab_tree'] = str(options['vocab_tree']) if options['vocab_tree'] else None
         report['settings']['view_batch_size'] = options['view_batch_size'] or (1 if options['super_resolution'] else 4)
         report['settings']['unsharp'] = options['unsharp'] if options['unsharp'] is not None else not options['super_resolution']
         lines = [f"Run completed: {report['finished_at_utc']}", f"Input: {report['input']}",
@@ -87,6 +115,12 @@ def benchmark_run(function):
                  f"Total elapsed: {total:.2f} s ({total / 60:.2f} min)"]
         lines += [f'{key}: {value if value is not None else "N/A"}' for key, value in run['counts'].items()]
         lines += [f'{key}: {value:.2f} s' for key, value in seconds.items()]
+        lines += [f'COLMAP command {key}: {value:.2f} s (subtotal)'
+                  for key, value in run.get('colmap_seconds', {}).items()]
+        lines += [f'Quality {key}: {value:.4f}' if isinstance(value, float) else f'Quality {key}: {value}'
+                  for key, value in run.get('quality', {}).items()]
+        lines += [f'Runtime target (600 s) met: {total <= 600}',
+                  'Absolute geographic accuracy: unverified (no independent checkpoint evaluation).']
         lines += [f'Preprocessing total (includes CAS and SR): {preprocessing:.2f} s',
                   f'Other/setup/cleanup: {report["other_seconds"]:.2f} s',
                   'Stage times are exclusive wall times; preprocessing total is a subtotal.',

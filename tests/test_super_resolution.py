@@ -54,7 +54,8 @@ class SuperResolutionTests(unittest.TestCase):
                 reader = capture.return_value
                 reader.isOpened.return_value = True
                 reader.get.return_value = 30
-                reader.read.side_effect = [(True, frame), (True, frame), (False, None)]
+                reader.grab.side_effect = [True, True, False]
+                reader.retrieve.return_value = (True, frame)
                 output = engine.extract_frames(Path('in.mp4'), Path(tmp), 1, 0, 50, 2,
                                                original_only=True)
                 self.assertEqual(int(cv2.imread(str(output/'frame_000000.jpg'))[0, 0, 0]), 100)

@@ -39,6 +39,55 @@ For another device on the same network, launch with `--host 0.0.0.0` and open
 `http://<computer-IP>:8001/`; the viewer link uses that same hostname on port 8000.
 
 
+### Video keyframes and runtime validation
+
+`--every 10` first samples the source video. Adaptive selection then operates on
+those candidates, using tracked image displacement and sharpness. It retains
+endpoints, keeps both sides of tracking breaks, and limits candidate gaps to six
+by default. Tracking failure retains extra views; there is no hard frame-count
+cap or guaranteed runtime. Image motion is a coverage heuristic, not metric
+parallax or proof of reconstruction accuracy. Photo selection is unchanged.
+
+```bash
+.venv/bin/python -m src.engine INPUT.mp4 --output runs/keyframes \
+  --every 10 --max-width 960 --steps 2000 --headless
+```
+
+Use `--keyframe-max-gap 1` to disable adaptive selection. Adjust
+`--keyframe-max-gap` (default 6), `--keyframe-motion` (default 0.06 of the image
+diagonal), and `--sequential-overlap` (default 12) for different capture motion.
+`--vocab-tree vocab_tree.bin` enables COLMAP retrieval-based loop detection;
+retaining revisited frames alone does not ensure loop closure. The original
+video matching overlap can be restored with `--sequential-overlap 30`.
+
+Selected frames and their candidate indices/reasons are recorded in
+`capture/keyframes/<input-and-settings-hash>/keyframes.json`. Original candidates
+are preserved. Benchmark reports distinguish `keyframe_candidates` from
+`frames_before_colmap`, report keyframe-selection time and individual COLMAP
+command subtotals, and state whether the completed run took at most 600 seconds.
+Command subtotals are included in COLMAP time and must not be added again.
+
+Video matching uses a dense window (`quadratic_overlap=0`): COLMAP's quadratic
+mode replaces the window with gaps 1, 2, 4, 8, ..., which verified about half as
+many pairs and made `global_mapper` about twice as slow on test footage.
+`--mapper-tracks-per-view` (default 1000, `0` = keep all) limits the tracks
+`global_mapper` optimizes; on a 319-view test it cut mapping time by ~25% with
+the same registration, reprojection error and held-out PSNR.
+
+### Training quality
+
+Training uses L1 plus a D-SSIM term (`--ssim-weight`, default 0.2, evaluated at
+half resolution for speed; `0` restores pure L1) and scales the position learning
+rate by the camera extent, as in 3DGS (`--no-scale-means-lr` disables it). Use
+`--eval-every 8` to hold out every 8th registered view and report PSNR/SSIM in
+`benchmark.log`/`benchmark.json` under `quality`; held-out views are not trained on,
+so leave it off for production models.
+
+Absolute geographic accuracy is reported as **unverified**. Photo EXIF GPS is
+used for neighbor matching, not an implemented geographic alignment or checkpoint
+evaluation. Video-only inputs have no geographic reference. A runtime pass is
+not a claim of <=1 m absolute error.
+
 ### Photo directories and metadata
 
 Every completed engine run writes `benchmark.log` (readable summary) and

@@ -52,9 +52,16 @@ class ImageDatasetTests(unittest.TestCase):
         for gps, mode in [(True, 'auto'), (False, 'auto'), (True, 'exhaustive')]:
             with self.subTest(gps=gps, mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                (root/'colmap/sparse/0').mkdir(parents=True)
+                (root/'photos').mkdir()
+                for i in range(3):
+                    Image.new('RGB', (100, 80)).save(root/'photos'/f'{i}.jpg')
                 dataset = ImageDataset(root/'photos', '80,50,40,0', True, gps, 50, 3)
-                with patch.object(engine, '_run') as run:
+                def fake_run(command):
+                    if command[1] == 'global_mapper':
+                        (root/'colmap/sparse/0').mkdir(parents=True)
+                    elif command[1] == 'image_undistorter':
+                        (root/'colmap/undistorted').mkdir()
+                with patch.object(engine, '_run', side_effect=fake_run) as run:
                     engine.run_colmap(dataset.capture, root/'colmap', None,
                                       photo_dataset=dataset, image_matching=mode)
                 commands = [call.args[0] for call in run.call_args_list]
@@ -74,6 +81,7 @@ class ImageDatasetTests(unittest.TestCase):
             root = Path(tmp)
             frame = root/'registered.png'
             Image.new('RGB', (10, 8), (50, 50, 50)).save(frame)
+            Image.new('RGB', (10, 8), (50, 50, 50)).save(root/'second.png')
             dataset = ImageDataset(root, None, True, False, 10, 2)
             with patch.object(engine, 'prepare_image_dataset', return_value=dataset), \
                  patch.object(engine, 'extract_frames') as video, \
@@ -83,15 +91,14 @@ class ImageDatasetTests(unittest.TestCase):
                  patch.object(engine, 'PreviewPublisher'), patch.object(engine, 'ensure_viewer'), \
                  patch.object(engine, 'train_splats', return_value={}) as train, \
                  patch.object(engine, 'export_gltf'):
-                engine.build_model(root, root/'out', use_server=True, brightness=10, contrast=2, unsharp=False)
+                engine.build_model(root, root/'out', use_server=True, brightness=10, contrast=2, unsharp=False, device='cpu', photo_every=1)
             video.assert_not_called()
             report = json.loads((root/'out/benchmark.json').read_text())
             self.assertEqual(report['frame_counts']['frames_before_colmap'], 2)
             self.assertEqual(report['frame_counts']['frames_after_colmap'], 1)
             self.assertIsNone(report['frame_counts']['decoded_video_frames'])
-            target = train.call_args.args[1][0]
-            with Image.open(target) as image:
-                self.assertEqual(image.getpixel((0, 0)), (110, 110, 110))
+            target = train.call_args.kwargs['targets']
+            self.assertEqual(target[0, 0, 0].tolist(), [110, 110, 110])
 
 
 if __name__ == '__main__':

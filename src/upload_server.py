@@ -22,7 +22,7 @@ def parameters(query, swinir_root=None, sr_checkpoint=None):
     result = {}
     for name, default, lower, upper, kind in (
         ('steps', '2000', 1, 1000000, int), ('every', '5', 1, 100000, int),
-        ('max-width', '1920', 0, 16384, int), ('brightness', '1', -255, 255, float),
+        ('max-width', '1920', 0, 16384, int), ('brightness', '0', -255, 255, float),
         ('contrast', '1', 0, 10, float), ('sharpness', '.5', 0, 1, float),
     ):
         value = kind(values.get(name, [default])[0])

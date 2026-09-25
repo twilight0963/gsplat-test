@@ -21,6 +21,7 @@ class UploadTests(unittest.TestCase):
     def test_parameters_enable_persistent_viewer_flag(self):
         p = parameters('output=runs/test-' + uuid.uuid4().hex)
         self.assertIn('use-server', p)
+        self.assertEqual(p['brightness'], '0.0')  # additive offset: 0 leaves pixels unchanged
         self.assertIsNone(p['use-server'])
 
     def test_jobs_launch_passes_boolean_flags_without_values(self):

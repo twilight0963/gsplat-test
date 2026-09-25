@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import monotonic
@@ -22,8 +23,9 @@ from src.gsplat_viewer import TrainingPreview, start_viewer
 from src.live_viewer import PreviewPublisher, ensure_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
+from src.keyframes import select_keyframes
 from src.image_dataset import ImageDataset, prepare_image_dataset
-from src.run_benchmark import benchmark_run, frame_counts, stage, timed
+from src.run_benchmark import benchmark_run, colmap_command, frame_counts, metrics, stage, timed
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 _PNG_FAST = [cv2.IMWRITE_PNG_COMPRESSION, 1]
@@ -52,7 +54,8 @@ def _image_size(path: Path) -> tuple[int, int] | None:
 def _run(command: list[str]) -> None:
     started = monotonic()
     try:
-        subprocess.run(command, check=True)
+        with colmap_command(command[1]) if command[0] == 'colmap' else nullcontext():
+            subprocess.run(command, check=True)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required executable not found: {command[0]}") from exc
     print(f"[timing] {' '.join(command[:2])}: {monotonic() - started:.1f}s", flush=True)
@@ -92,11 +95,12 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int, bright
     # JPEG encoding releases the GIL, so overlap it with video decoding.
     with ThreadPoolExecutor(max_workers=4) as pool:
         pending = []
-        while True:
-            ok, frame = reader.read()
-            if not ok:
-                break
+        while reader.grab():
+            # grab() skips the colour conversion/copy for frames we don't keep.
             if index % every == 0:
+                ok, frame = reader.retrieve()
+                if not ok:
+                    break
                 if max_width and frame.shape[1] > max_width:
                     scale = max_width / frame.shape[1]
                     frame = cv2.resize(
@@ -190,14 +194,13 @@ def apply_cas(images: list[Path], output: Path, sharpness: float) -> list[Path]:
     return targets
 
 
-def _blur7(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable 7-tap Gaussian, equivalent to cv2.GaussianBlur(ksize=(0,0)) at sigma=1."""
-    r = 3
+def _blur7(x: torch.Tensor, sigma: float, r: int = 3, mode: str = "reflect") -> torch.Tensor:
+    """Separable (2r+1)-tap Gaussian; r=3 matches cv2.GaussianBlur(ksize=(0,0)) at sigma=1."""
     axis = torch.arange(-r, r + 1, device=x.device, dtype=x.dtype)
     k = torch.exp(-axis ** 2 / (2 * sigma ** 2))
     k = k / k.sum()
     c = x.shape[1]
-    x = F.pad(x, (r, r, r, r), mode="reflect")
+    x = F.pad(x, (r, r, r, r), mode=mode)
     x = F.conv2d(x, k.view(1, 1, 1, -1).repeat(c, 1, 1, 1), groups=c)
     return F.conv2d(x, k.view(1, 1, -1, 1).repeat(c, 1, 1, 1), groups=c)
 
@@ -222,6 +225,25 @@ def _cas(x: torch.Tensor, sharpness: float) -> torch.Tensor:
     return (((b + d + f + h) * w + e) / (1 + 4 * w)).clamp(0, 1)
 
 
+def ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Mean SSIM of (N, H, W, 3) images in [0, 1] (11-tap Gaussian, sigma 1.5)."""
+    x, y = x.float().permute(0, 3, 1, 2), y.float().permute(0, 3, 1, 2)
+    blur = lambda t: _blur7(t, 1.5, 5, "replicate")
+    mx, my = blur(x), blur(y)
+    vx, vy, cov = blur(x * x) - mx * mx, blur(y * y) - my * my, blur(x * y) - mx * my
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    return (((2 * mx * my + c1) * (2 * cov + c2))
+            / ((mx * mx + my * my + c1) * (vx + vy + c2))).mean()
+
+
+def _scene_scale(viewmats: torch.Tensor) -> float:
+    """3DGS-style extent: 1.1x the largest camera distance from the camera centroid."""
+    R, t = viewmats[:, :3, :3], viewmats[:, :3, 3:]
+    centers = -(R.transpose(1, 2) @ t).squeeze(-1)
+    radius = float((centers - centers.mean(dim=0)).norm(dim=-1).max())
+    return 1.1 * radius if radius > 0 else 1.0
+
+
 def _read_rgb_uint8(path: Path) -> torch.Tensor:
     image = cv2.imread(str(path))
     if image is None:
@@ -239,13 +261,20 @@ def _load_targets_parallel(images: list[Path]) -> torch.Tensor:
 @timed('preprocessing')
 def build_targets_gpu(images: list[Path], brightness: float, contrast: float,
                       unsharp: bool, sharpness: float, device: str,
-                      chunk: int = 32, unsharp_amount: float = 1.2) -> torch.Tensor:
+                      chunk: int | None = None, unsharp_amount: float = 1.2,
+                      chunk_pixels: int = 16_000_000) -> torch.Tensor:
     """Brightness/contrast -> unsharp -> CAS, entirely in memory.
 
     Returns an (N, H, W, 3) uint8 RGB tensor (pinned on CUDA) ready for training.
     Images are streamed in chunks, so peak RAM is one copy of the final targets.
+    Unsharp + CAS keep ~7 float copies of a chunk alive on the GPU, so by default
+    a chunk holds at most `chunk_pixels` pixels (~1.4 GB peak; 32 frames at 960 px,
+    7 at 1920 px) rather than a fixed frame count.
     """
     n = len(images)
+    if chunk is None:
+        size = _image_size(images[0]) if images else None
+        chunk = 32 if size is None else max(1, min(32, chunk_pixels // (size[0] * size[1])))
     out: torch.Tensor | None = None
     for start in range(0, n, chunk):
         raw = _load_targets_parallel(images[start:start + chunk])
@@ -343,8 +372,11 @@ def run_colmap(
     *, photo_dataset: ImageDataset | None = None,
     image_matching: str = 'auto', spatial_neighbors: int = 12,
     max_features: int = 4096, gp_iterations: int = 50, ba_iterations: int = 3,
-    use_cache: bool = True,
+    use_cache: bool = True, sequential_overlap: int = 12,
+    mapper_tracks_per_view: int | None = None,
 ) -> Path:
+    if sequential_overlap < 1:
+        raise ValueError('Sequential overlap must be >= 1')
     files = _list_images(capture)
     num_images = len(files)
     undistorted = workdir / "undistorted"
@@ -352,6 +384,9 @@ def run_colmap(
     # ---- cache: skip the whole SfM when inputs and settings are unchanged ----
     key = _colmap_key(files, {
         "video": photo_dataset is None,
+        "sequential_overlap": sequential_overlap,
+        "quadratic_overlap": 0,
+        "mapper_tracks_per_view": mapper_tracks_per_view,
         "matching": image_matching,
         "neighbors": spatial_neighbors,
         "max_features": max_features,
@@ -429,7 +464,11 @@ def run_colmap(
                   '--SequentialMatching.overlap', '20'])
     else:
         match_command = ['colmap', 'sequential_matcher', '--database_path', str(database),
-                         '--SequentialMatching.overlap', '30']
+                         '--SequentialMatching.overlap', str(sequential_overlap),
+                         # Quadratic mode replaces the window with gaps 1, 2, 4, 8, ...; a dense
+                         # window verifies ~2x more pairs and roughly halves global_mapper time.
+                         # Loop detection still supplies the long-range pairs.
+                         '--SequentialMatching.quadratic_overlap', '0']
         if vocab_tree is not None:
             match_command += ['--SequentialMatching.loop_detection', '1',
                               '--SequentialMatching.vocab_tree_path', str(vocab_tree)]
@@ -441,7 +480,7 @@ def run_colmap(
         "--database_path", str(database),
     ])
 
-    _run([
+    mapper_command = [
         "colmap", "global_mapper",
         "--database_path", str(database),
         "--image_path", str(capture),
@@ -451,7 +490,10 @@ def run_colmap(
         "--GlobalMapper.gp_max_num_iterations", str(gp_iterations),
         "--GlobalMapper.ba_refine_focal_length", "1",
         "--GlobalMapper.ba_refine_extra_params", "1",
-    ])
+    ]
+    if mapper_tracks_per_view:
+        mapper_command += ["--GlobalMapper.track_required_tracks_per_view", str(mapper_tracks_per_view)]
+    _run(mapper_command)
 
     models = sorted(p for p in sparse.iterdir() if p.is_dir())
     if not models:
@@ -590,6 +632,8 @@ def train_splats(
     targets: torch.Tensor | None = None,
     voxel_stride: int = 1,
     preview_interval: float = 2.0,
+    ssim_weight: float = 0.2,
+    scale_means_lr: bool = True,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -597,6 +641,8 @@ def train_splats(
         raise ValueError("--view-batch-size must be at least 1")
     if voxel_stride < 1:
         raise ValueError("--voxel-stride must be at least 1")
+    if not 0 <= ssim_weight <= 1:
+        raise ValueError("--ssim-weight must be between 0 and 1")
     quality_config = voxel_config or VoxelGuidedConfig()
     if quality_config.max_axis_ratio < 1 or quality_config.scale_regularization < 0:
         raise ValueError("Scale ratio must be >= 1 and regularization must be >= 0")
@@ -652,6 +698,9 @@ def train_splats(
 
     viewmats_all = data["viewmats"].to(device)
     Ks_all = data["Ks"].to(device)
+    if scale_means_lr:
+        # Positions are learned in scene units; COLMAP's scale is arbitrary.
+        means_lr_init = means_lr_init * _scene_scale(data["viewmats"])
     num_views = len(images) if target_all is None else target_all.shape[0]
     optimizer = torch.optim.Adam([
         {"params": [means], "lr": means_lr_init, "name": "means"},
@@ -739,6 +788,11 @@ def train_splats(
             )
             loss = (torch.abs(rendered - target).mean() if base_target is None else
                     sr_training_loss(rendered, target, base_target, sr_prior_weight))
+        if ssim_weight and base_target is None:
+            # Half resolution keeps SSIM ~4x cheaper (full-res roughly doubles step time);
+            # it runs outside autocast because it subtracts near-equal moments.
+            half = lambda t: F.avg_pool2d(t.float().permute(0, 3, 1, 2), 2).permute(0, 2, 3, 1)
+            loss = (1 - ssim_weight) * loss + ssim_weight * (1 - ssim(half(rendered), half(target)))
         if quality_config.scale_regularization:
             loss = loss + quality_config.scale_regularization * _scale_regularizer(
                 scales, quality_config.max_axis_ratio
@@ -797,6 +851,24 @@ def train_splats(
     return result
 
 
+@torch.no_grad()
+def evaluate_views(result: dict[str, torch.Tensor], viewmats: torch.Tensor, Ks: torch.Tensor,
+                   targets: torch.Tensor, width: int, height: int, device: str) -> dict[str, float]:
+    """PSNR/SSIM of the trained splats on views that were held out of training."""
+    params = (result["means"].to(device), result["quats"].to(device),
+              result["scales"].to(device).exp(), result["opacities"].to(device).sigmoid(),
+              result["colors"].to(device))
+    psnr, similarity = [], []
+    for i in range(targets.shape[0]):
+        rendered, _, _ = rasterization(*params, viewmats[i:i + 1].to(device), Ks[i:i + 1].to(device),
+                                       width, height, packed=True)
+        rendered = rendered.clamp(0, 1)
+        target = targets[i:i + 1].to(device).float() / 255.0
+        psnr.append(float(-10 * torch.log10(F.mse_loss(rendered, target).clamp_min(1e-10))))
+        similarity.append(float(ssim(rendered, target)))
+    return {"eval_views": len(psnr), "eval_psnr": float(np.mean(psnr)), "eval_ssim": float(np.mean(similarity))}
+
+
 @timed('export')
 def export_gltf(result: dict[str, torch.Tensor], path: Path) -> None:
     means = result["means"].numpy().astype(np.float32)
@@ -850,7 +922,22 @@ def build_model(
     gp_iterations: int = 50,
     ba_iterations: int = 3,
     voxel_stride: int = 1,
+    keyframe_max_gap: int = 6,
+    keyframe_motion: float = .06,
+    sequential_overlap: int = 12,
+    mapper_tracks_per_view: int | None = 1000,
+    eval_every: int = 0,
+    ssim_weight: float = 0.2,
+    scale_means_lr: bool = True,
 ) -> Path:
+    if mapper_tracks_per_view is not None and mapper_tracks_per_view < 0:
+        raise ValueError('--mapper-tracks-per-view must be >= 0')
+    if eval_every < 0 or eval_every == 1:
+        raise ValueError('--eval-every must be 0 (off) or >= 2')
+    if eval_every and super_resolution:
+        raise ValueError('--eval-every is not supported with super-resolution')
+    if keyframe_max_gap < 1 or not np.isfinite(keyframe_motion) or not 0 < keyframe_motion < 1 or sequential_overlap < 1:
+        raise ValueError('Invalid keyframe or sequential overlap settings')
     if image_matching not in ('auto', 'exhaustive') or spatial_neighbors < 1:
         raise ValueError('Invalid image matching mode or spatial neighbor count')
     if photo_every < 1 or max_features < 256:
@@ -871,7 +958,8 @@ def build_model(
         unsharp = not super_resolution
     colmap_options = dict(
         max_features=max_features, gp_iterations=gp_iterations,
-        ba_iterations=ba_iterations, use_cache=colmap_cache,
+        ba_iterations=ba_iterations, use_cache=colmap_cache, sequential_overlap=sequential_overlap,
+        mapper_tracks_per_view=mapper_tracks_per_view,
     )
     photo_dataset = None
     if video.is_dir():
@@ -890,6 +978,13 @@ def build_model(
         capture_dir = output / "capture" / "originals"
         capture = extract_frames(video, capture_dir, every, max_width, brightness, contrast,
                                  sharpness, original_only=True, unsharp=False)
+        frame_counts(keyframe_candidates=len(_list_images(capture)))
+        with stage('keyframe_selection'):
+            candidates = _list_images(capture)
+            selection_key = _colmap_key(candidates, {'gap': keyframe_max_gap, 'motion': keyframe_motion})
+            capture = select_keyframes(candidates, output / 'capture' / 'keyframes' / selection_key,
+                                       max_gap=keyframe_max_gap, motion_threshold=keyframe_motion)
+        frame_counts(frames_before_colmap=len(_list_images(capture)))
         undistorted = run_colmap(capture, output / "colmap", vocab_tree, **colmap_options)
     print("Loading reconstructions...", flush=True)
     data, images, width, height = load_reconstruction(undistorted, max_points)
@@ -907,6 +1002,14 @@ def build_model(
         # Keep originals and metadata intact for SfM; enhance only training targets.
         print('Preprocessing registered images on the GPU (brightness/contrast, unsharp, CAS)...', flush=True)
         targets = build_targets_gpu(images, brightness, contrast, unsharp, sharpness, device)
+    held_out = None
+    if eval_every:
+        # Mip-NeRF 360 convention: every Nth registered view is a test view.
+        test = torch.arange(len(images)) % eval_every == 0
+        held_out = (data["viewmats"][test], data["Ks"][test], targets[test])
+        data = {**data, "viewmats": data["viewmats"][~test], "Ks": data["Ks"][~test]}
+        images = [image for image, t in zip(images, test.tolist()) if not t]
+        targets = targets[~test]
     print("Training splats...")
     glb_path = output / "model.glb"
     if headless:
@@ -940,7 +1043,13 @@ def build_model(
             opacity_reset_interval, mixed_precision, preview=preview,
             base_images=base_images, sr_prior_weight=sr_prior_weight,
             targets=targets, voxel_stride=voxel_stride,
+            ssim_weight=ssim_weight, scale_means_lr=scale_means_lr,
         )
+        if held_out is not None:
+            quality = evaluate_views(result, *held_out, width, height, device)
+            metrics(**quality)
+            print(f"Held-out views: {quality['eval_views']}, PSNR {quality['eval_psnr']:.2f} dB, "
+                  f"SSIM {quality['eval_ssim']:.4f}", flush=True)
         print("Exporting model...", flush=True)
         export_gltf(result, glb_path)
         if preview is not None:
@@ -966,6 +1075,20 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("runs/gsplat"))
     parser.add_argument("--every", type=int, default=5,
                         help="Keep every Nth video frame (videos only; see --photo-every for photo directories).")
+    parser.add_argument('--keyframe-max-gap', type=int, default=6,
+                        help='Video: maximum gap in candidates AFTER --every; 1 disables selection (default: 6).')
+    parser.add_argument('--keyframe-motion', type=float, default=.06,
+                        help='Video: tracked displacement / image diagonal triggering a keyframe (default: .06).')
+    parser.add_argument('--sequential-overlap', type=int, default=12,
+                        help='Video COLMAP matching overlap (default: 12).')
+    parser.add_argument('--mapper-tracks-per-view', type=int, default=1000,
+                        help='Tracks global_mapper keeps per image; fewer is faster (default: 1000, 0 = all).')
+    parser.add_argument('--eval-every', type=int, default=0,
+                        help='Hold out every Nth registered view and report PSNR/SSIM (0 = off, 8 is standard).')
+    parser.add_argument('--ssim-weight', type=float, default=0.2,
+                        help='D-SSIM weight in the training loss (0 = pure L1; ignored with SR).')
+    parser.add_argument('--no-scale-means-lr', dest='scale_means_lr', action='store_false',
+                        help='Do not scale the position learning rate by the scene extent.')
     parser.add_argument("--photo-every", type=int, default=2,
                         help="Use every Nth photo for SfM/training in image directories "
                              "(default: 2; 1 uses all photos). Matching cost grows ~quadratically with image count.")
@@ -1110,6 +1233,11 @@ def main() -> None:
             headless=args.headless, colmap_cache=args.colmap_cache,
             gp_iterations=args.gp_iterations, ba_iterations=args.ba_iterations,
             voxel_stride=args.voxel_stride,
+            keyframe_max_gap=args.keyframe_max_gap, keyframe_motion=args.keyframe_motion,
+            sequential_overlap=args.sequential_overlap,
+            mapper_tracks_per_view=args.mapper_tracks_per_view,
+            eval_every=args.eval_every, ssim_weight=args.ssim_weight,
+            scale_means_lr=args.scale_means_lr,
         ),
         flush=True
     )
