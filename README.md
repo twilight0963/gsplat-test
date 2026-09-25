@@ -10,8 +10,14 @@ Test repository for Gaussian Splat model
 
 Open **http://localhost:8001/**. Select a video and set steps, frame interval,
 maximum width, output folder, brightness, contrast, and sharpness. Output must be
-a new folder inside `runs/`. Uploaded videos are retained in `runs/.uploads/`.
+a new folder inside `runs/`. Uploads are kept in `runs/.uploads/` while a job runs.
 The page shows upload progress followed by the latest engine stdout/stderr line.
+
+When an uploaded job saves its model, the server deletes the upload from
+`runs/.uploads/` and the run's `capture/`, `capture_subset/`, `colmap/` and `sr/`
+folders. It keeps `model.glb`, `benchmark.json`, `benchmark.log` and
+`photo_metadata.json`. Failed jobs keep everything for inspection or a retry.
+Command-line runs are not cleaned up, so their COLMAP cache can be reused.
 
 Clicking **Upload and build** keeps you on the upload page. A new tab opens at
 **http://localhost:8000/** only when the training viewer reports it is ready.
@@ -170,9 +176,14 @@ SR defaults to one camera per training step, with unsharp masking disabled.
 `--unsharp` explicitly enables it after SR, before CAS; `--no-unsharp` disables
 it in the existing mode too. Brightness remains an additive pixel offset and
 contrast a multiplier. CAS remains enabled, including at sharpness 0 (minimum
-extra sharpening, not a bypass). SR inference uses overlapping tiles with CPU
-assembly, and runs in a separate process that exits before training begins.
-Training reads only the selected SR image batch from disk. The existing Gaussian
+extra sharpening, not a bypass). SR inference runs overlapping tiles in batches
+of 8 in fp16 on the GPU (about 2x faster than one fp32 tile at a time, with the
+same output to within 65 dB PSNR), in a separate process that exits before
+training begins. CAS for SR targets runs on the GPU in linear light, matching
+FidelityFX_CLI to within about 0.2-0.45/255 on average. SR targets are held in
+RAM during training when they fit in half of the available memory (about 16 MB
+per view at 1280 px input); otherwise each view is read from disk a few steps
+ahead of training. The existing Gaussian
 budget controls still apply. These defaults are a starting point for 6 GB GPUs;
 actual peak memory depends on scene complexity and the live viewer as well.
 

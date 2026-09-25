@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -13,6 +14,9 @@ from urllib.parse import parse_qs, urlsplit
 import socket
 
 ROOT = Path(__file__).resolve().parent.parent
+# Intermediates of an upload job, removed once its model is saved. The model,
+# benchmark reports and photo_metadata.json in the output folder are kept.
+TEMPORARY_OUTPUTS = ('capture', 'capture_subset', 'colmap', 'sr')
 
 
 def parameters(query, swinir_root=None, sr_checkpoint=None):
@@ -66,10 +70,39 @@ def parameters(query, swinir_root=None, sr_checkpoint=None):
     return result
 
 
+def clean_up(upload, output):
+    """Delete a finished job's upload and intermediates; return the bytes freed.
+
+    Only paths inside runs/ are touched: the upload must be a direct child of
+    runs/.uploads and the output a folder inside runs/.
+    """
+    runs = (ROOT / 'runs').resolve()
+    upload, output = Path(upload), Path(output)
+    if upload.resolve().parent != runs / '.uploads' or not output.resolve().is_relative_to(runs) \
+            or output.resolve() == runs:
+        raise ValueError(f'Refusing to clean up outside runs/: {upload}, {output}')
+    freed, seen = 0, set()
+    for path in (upload, *(output / name for name in TEMPORARY_OUTPUTS)):
+        if not path.exists() and not path.is_symlink():
+            continue
+        files = [path] if path.is_file() or path.is_symlink() else [f for f in path.rglob('*') if f.is_file() and not f.is_symlink()]
+        for f in files:
+            stat = f.lstat()
+            if (stat.st_dev, stat.st_ino) not in seen:  # hard links are freed once
+                seen.add((stat.st_dev, stat.st_ino))
+                freed += stat.st_size
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    return freed
+
+
 class Jobs:
     def __init__(self):
         self.lock = Lock()
         self.process = None
+        self.job = None  # (upload, output) of the running job
         self.state = {'busy': False, 'status': 'Ready to upload', 'viewer': False, 'saved': False}
 
     def snapshot(self):
@@ -92,6 +125,7 @@ class Jobs:
             command.append('--' + key)
             if value is not None:
                 command.append(value)
+        self.job = (Path(video), Path(params['output']))
         self.process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
         Thread(target=self.monitor, daemon=True).start()
@@ -114,11 +148,22 @@ class Jobs:
             else:
                 line = (line + char)[-4000:]
         code = process.wait()
+        note = None
+        # Failed jobs keep their upload and intermediates for inspection or a retry.
+        if not code and self.job is not None and (self.job[1] / 'model.glb').is_file():
+            try:
+                freed = clean_up(*self.job)
+                note = f'Model saved: {self.job[1] / "model.glb"}. Removed temporary files ({freed / 1024 ** 3:.2f} GiB).'
+            except (OSError, ValueError) as exc:
+                note = f'Model saved: {self.job[1] / "model.glb"}. Could not remove temporary files: {exc}'
+            print(note, flush=True)
         with self.lock:
             self.state['busy'] = False
             # The detached viewer survives engine exit.
             if code:
                 self.state['status'] = f'Failed (exit {code}): ' + self.state['status']
+            elif note:
+                self.state['status'] = note
 
     def close(self):
         if self.process is not None and self.process.poll() is None:

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from contextlib import nullcontext
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import monotonic
@@ -205,8 +206,16 @@ def _blur7(x: torch.Tensor, sigma: float, r: int = 3, mode: str = "reflect") -> 
     return F.conv2d(x, k.view(1, 1, -1, 1).repeat(c, 1, 1, 1), groups=c)
 
 
-def _cas(x: torch.Tensor, sharpness: float) -> torch.Tensor:
-    """AMD FidelityFX CAS on (N, 3, H, W) in [0, 1]."""
+def _cas(x: torch.Tensor, sharpness: float, linear: bool = False) -> torch.Tensor:
+    """AMD FidelityFX CAS on (N, 3, H, W) in [0, 1].
+
+    `linear=True` sharpens in linear light like FidelityFX_CLI.exe does (within
+    0.2-0.45/255 mean error of its output for sharpness 0.2-1.0 on SR targets).
+    """
+    if linear:
+        x = torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+        y = _cas(x, sharpness)
+        return torch.where(y <= 0.0031308, y * 12.92, 1.055 * y.clamp_min(0) ** (1 / 2.4) - 0.055).clamp(0, 1)
     H, W = x.shape[-2:]
     p = F.pad(x, (1, 1, 1, 1), mode="replicate")
 
@@ -258,14 +267,39 @@ def _load_targets_parallel(images: list[Path]) -> torch.Tensor:
         return torch.stack(frames)
 
 
+def _enhance(raw: torch.Tensor, brightness: float, contrast: float, unsharp: bool,
+             sharpness: float, unsharp_amount: float = 1.2, linear_cas: bool = False) -> torch.Tensor:
+    """(N, H, W, 3) uint8 -> the same, on raw's device: brightness/contrast -> unsharp -> CAS."""
+    x = raw.permute(0, 3, 1, 2).float()
+    if contrast != 1.0 or brightness != 0.0:
+        x = (x * contrast + brightness).clamp_(0, 255)
+    if unsharp:
+        # Same math as cv2.addWeighted(frame, 1 + amount, blurred, -amount, 0)
+        x = (x * (1 + unsharp_amount) - _blur7(x, 1.0) * unsharp_amount).clamp_(0, 255)
+    x = _cas(x / 255.0, sharpness, linear_cas) * 255.0
+    return x.round().clamp_(0, 255).byte().permute(0, 2, 3, 1)
+
+
+def _available_ram() -> int | None:
+    try:
+        with open('/proc/meminfo') as meminfo:
+            for line in meminfo:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 @timed('preprocessing')
 def build_targets_gpu(images: list[Path], brightness: float, contrast: float,
                       unsharp: bool, sharpness: float, device: str,
                       chunk: int | None = None, unsharp_amount: float = 1.2,
-                      chunk_pixels: int = 16_000_000) -> torch.Tensor:
+                      chunk_pixels: int = 16_000_000, linear_cas: bool = False,
+                      pin: bool | None = None) -> torch.Tensor:
     """Brightness/contrast -> unsharp -> CAS, entirely in memory.
 
-    Returns an (N, H, W, 3) uint8 RGB tensor (pinned on CUDA) ready for training.
+    Returns an (N, H, W, 3) uint8 RGB tensor (pinned on CUDA unless `pin=False`) ready for training.
     Images are streamed in chunks, so peak RAM is one copy of the final targets.
     Unsharp + CAS keep ~7 float copies of a chunk alive on the GPU, so by default
     a chunk holds at most `chunk_pixels` pixels (~1.4 GB peak; 32 frames at 960 px,
@@ -279,29 +313,31 @@ def build_targets_gpu(images: list[Path], brightness: float, contrast: float,
     for start in range(0, n, chunk):
         raw = _load_targets_parallel(images[start:start + chunk])
         if out is None:
-            out = torch.empty((n, *raw.shape[1:]), dtype=torch.uint8, pin_memory=(device == "cuda"))
+            pinned = device == "cuda" if pin is None else pin
+            out = torch.empty((n, *raw.shape[1:]), dtype=torch.uint8, pin_memory=pinned)
         elif raw.shape[1:] != out.shape[1:]:
             raise ValueError("Undistorted images have different dimensions")
-        x = raw.to(device).permute(0, 3, 1, 2).float()
-        if contrast != 1.0 or brightness != 0.0:
-            x = (x * contrast + brightness).clamp_(0, 255)
-        if unsharp:
-            # Same math as cv2.addWeighted(frame, 1 + amount, blurred, -amount, 0)
-            x = (x * (1 + unsharp_amount) - _blur7(x, 1.0) * unsharp_amount).clamp_(0, 255)
-        x = _cas(x / 255.0, sharpness) * 255.0
-        out[start:start + raw.shape[0]] = x.round().clamp_(0, 255).byte().permute(0, 2, 3, 1).cpu()
+        out[start:start + raw.shape[0]] = _enhance(raw.to(device), brightness, contrast, unsharp,
+                                                   sharpness, unsharp_amount, linear_cas).cpu()
     return out
 
 
 # --------------------------------------------------------------------------- #
-# Super-resolution targets (unchanged behaviour, faster I/O)
+# Super-resolution targets
 # --------------------------------------------------------------------------- #
 
 @timed('preprocessing')
 def prepare_sr_targets(images: list[Path], output: Path, width: int, height: int,
                        brightness: float, contrast: float, sharpness: float,
                        unsharp: bool, root: Path, checkpoint: Path, tile: int,
-                       device: str) -> tuple[list[Path], list[Path]]:
+                       device: str) -> tuple[list[Path], dict]:
+    """SwinIR 2x targets plus base targets, as keyword arguments for train_splats.
+
+    Base images carry brightness/contrast only; enhanced images get optional unsharp
+    and linear-light CAS on the GPU (matching FidelityFX_CLI). Both are kept in RAM
+    ({'targets', 'base_targets'}) when they fit in half of the available memory;
+    otherwise training reads them per step ({'base_images', 'enhance'}).
+    """
     base_dir = output / "base"
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -330,19 +366,22 @@ def prepare_sr_targets(images: list[Path], output: Path, width: int, height: int
               "--manifest", str(manifest.resolve()), "--output", str(enhanced.resolve()),
               "--tile", str(tile), "--device", device])
     targets = [enhanced / p.name for p in base]
-
-    def check_and_sharpen(path: Path) -> None:
-        frame = cv2.imread(str(path))
-        if frame is None or frame.shape[:2] != (height * 2, width * 2):
+    for path in targets[:1]:
+        if _image_size(path) != (height * 2, width * 2):
             raise RuntimeError(f"SwinIR did not produce a matching 2x image: {path}")
-        if unsharp:
-            if not cv2.imwrite(str(path), unsharp_mask(frame, amount=1.2), _PNG_FAST):
-                raise RuntimeError(f"Could not write {path}")
-
-    with ThreadPoolExecutor() as pool:
-        list(pool.map(check_and_sharpen, targets))
-    print("Applying CAS to super-resolution targets...", flush=True)
-    return apply_cas(targets, output / "cas", sharpness), base
+    needed = len(base) * width * height * 3 * 5  # 2x enhanced (4 px per base px) + base
+    available = _available_ram()
+    if available is not None and needed > available // 2:
+        print(f"SR targets ({needed / 1024 ** 3:.1f} GiB) exceed half of free RAM; "
+              "reading them from disk during training.", flush=True)
+        enhance = lambda raw: _enhance(raw, 0.0, 1.0, unsharp, sharpness, linear_cas=True)
+        return targets, {"base_images": base, "enhance": enhance}
+    print("Applying CAS to super-resolution targets on the GPU...", flush=True)
+    enhanced_targets = build_targets_gpu(targets, 0.0, 1.0, unsharp, sharpness, device,
+                                         linear_cas=True, pin=False)
+    if tuple(enhanced_targets.shape[1:3]) != (height * 2, width * 2):
+        raise RuntimeError("SwinIR did not produce matching 2x images")
+    return targets, {"targets": enhanced_targets, "base_targets": _load_targets_parallel(base)}
 
 
 def sr_training_loss(rendered: torch.Tensor, enhanced: torch.Tensor,
@@ -634,6 +673,8 @@ def train_splats(
     preview_interval: float = 2.0,
     ssim_weight: float = 0.2,
     scale_means_lr: bool = True,
+    base_targets: torch.Tensor | None = None,
+    enhance=None,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -657,8 +698,12 @@ def train_splats(
         raise ValueError("SR prior weight must be between 0 and 1")
     if base_images is not None and len(base_images) != len(images):
         raise ValueError("SR base and enhanced targets must have matching view counts")
+    if base_targets is not None and (targets is None or len(base_targets) != len(targets)
+                                     or tuple(base_targets.shape[1:3]) != (height // 2, width // 2)):
+        raise ValueError("SR base targets must match the enhanced targets and half the render size")
 
-    # Targets: prebuilt in-memory tensor (standard path) > on-disk SR images > load now.
+    # Targets: prebuilt in-memory tensors (standard path, or SR with base_targets)
+    # > on-disk SR images read a few steps ahead > load now.
     if targets is not None:
         if tuple(targets.shape[1:3]) != (height, width):
             raise ValueError("Prebuilt targets do not match the render cameras")
@@ -667,7 +712,8 @@ def train_splats(
         target_all = None  # SR images stay on disk; only the current batch is loaded.
     else:
         target_all = _load_targets_parallel(images)
-    if target_all is not None and device == "cuda" and not target_all.is_pinned():
+    # In-memory SR targets are several GiB; they are copied per view instead of pinned.
+    if target_all is not None and device == "cuda" and not target_all.is_pinned() and base_targets is None:
         target_all = target_all.pin_memory()
 
     means = data["means"].to(device).requires_grad_()
@@ -750,24 +796,48 @@ def train_splats(
     report(0)
 
     recovery_steps = max(quality_config.prune_interval, (num_views + view_batch_size - 1) // view_batch_size)
-    # Permutation lives on the CPU so indexing host-side targets never forces a GPU sync.
-    perm = torch.randperm(num_views)
-    cursor = 0
-    for step in range(steps):
-        if cursor >= num_views:
+    # Permutations live on the CPU so indexing host-side targets never forces a GPU sync.
+    def view_batches():
+        while True:
             perm = torch.randperm(num_views)
-            cursor = 0
-        idx = perm[cursor : cursor + view_batch_size]
-        cursor += view_batch_size
+            for start in range(0, num_views, view_batch_size):
+                yield perm[start:start + view_batch_size]
+
+    batches = view_batches()
+
+    def load_views(idx: torch.Tensor):
+        selected = idx.tolist()
+        return (_load_targets_parallel([images[i] for i in selected]),
+                _load_targets_parallel([base_images[i] for i in selected]))
+
+    # On-disk SR targets: decode the next few steps' views in threads while this step
+    # trains (one 2x PNG takes longer to decode than a training step).
+    ahead = 3
+    reader = ThreadPoolExecutor(max_workers=ahead) if target_all is None else None
+    upcoming = deque()
+    if reader is not None:
+        for _ in range(min(ahead, steps)):
+            view_idx = next(batches)
+            upcoming.append((view_idx, reader.submit(load_views, view_idx)))
+    for step in range(steps):
+        if reader is None:
+            idx = next(batches)
+        else:
+            idx, loading = upcoming.popleft()
+            raw, base_raw = loading.result()
+            if step + ahead < steps:
+                view_idx = next(batches)
+                upcoming.append((view_idx, reader.submit(load_views, view_idx)))
         idx_dev = idx.to(device, non_blocking=True)
 
         if target_all is not None:
             target = target_all[idx].to(device, non_blocking=True).float() / 255.0
-            base_target = None
+            base_target = (None if base_targets is None else
+                           base_targets[idx].to(device, non_blocking=True).float() / 255.0)
         else:
-            selected = idx.tolist()
-            target = _load_targets_parallel([images[i] for i in selected]).to(device).float() / 255.0
-            base_target = _load_targets_parallel([base_images[i] for i in selected]).to(device).float() / 255.0
+            raw = raw.to(device)
+            target = (raw if enhance is None else enhance(raw)).float() / 255.0
+            base_target = base_raw.to(device).float() / 255.0
             if target.shape[1:3] != (height, width) or base_target.shape[1:3] != (height // 2, width // 2):
                 raise ValueError("SR target dimensions do not match the render cameras")
         viewmats = viewmats_all[idx_dev]
@@ -827,6 +897,9 @@ def train_splats(
                 voxel_opt.pause_after_reset(step, recovery_steps)
 
         report(step + 1)
+
+    if reader is not None:
+        reader.shutdown()
 
     with torch.no_grad():
         quats.copy_(quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8))
@@ -989,12 +1062,13 @@ def build_model(
     print("Loading reconstructions...", flush=True)
     data, images, width, height = load_reconstruction(undistorted, max_points)
     frame_counts(frames_after_colmap=len(images))
-    base_images = None
+    sr_inputs = {}
     targets = None
     if super_resolution:
-        images, base_images = prepare_sr_targets(
+        images, sr_inputs = prepare_sr_targets(
             images, output / "sr", width, height, brightness, contrast, sharpness,
             unsharp, swinir_root, sr_checkpoint, sr_tile, device)
+        targets = sr_inputs.pop("targets", None)
         data["Ks"] = data["Ks"].clone()
         data["Ks"][:, :2, :] *= 2
         width, height = width * 2, height * 2
@@ -1041,8 +1115,8 @@ def build_model(
             voxel_guided, voxel_config,
             means_lr_init, means_lr_final_ratio,
             opacity_reset_interval, mixed_precision, preview=preview,
-            base_images=base_images, sr_prior_weight=sr_prior_weight,
-            targets=targets, voxel_stride=voxel_stride,
+            sr_prior_weight=sr_prior_weight, targets=targets, voxel_stride=voxel_stride,
+            **sr_inputs,
             ssim_weight=ssim_weight, scale_means_lr=scale_means_lr,
         )
         if held_out is not None:
