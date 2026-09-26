@@ -19,6 +19,11 @@ import pycolmap
 import torch
 import torch.nn.functional as F
 from gsplat import rasterization
+from gsplat.strategy import MCMCStrategy
+try:  # Optional fused CUDA SSIM (see README); training falls back to ssim() below.
+    from fused_ssim import fused_ssim
+except ImportError:
+    fused_ssim = None
 from src.clip_box import estimate_oriented_box, fit_subject_box
 from src.gsplat_viewer import TrainingPreview, start_viewer
 from src.live_viewer import PreviewPublisher, ensure_viewer
@@ -243,6 +248,34 @@ def ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     c1, c2 = 0.01 ** 2, 0.03 ** 2
     return (((2 * mx * my + c1) * (2 * cov + c2))
             / ((mx * mx + my * my + c1) * (vx + vy + c2))).mean()
+
+
+def _training_ssim(rendered: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """SSIM for the loss, in fp32 (it subtracts near-equal moments, so never bf16).
+
+    The fused CUDA kernel runs at full resolution (~3 ms per 4x960x540 batch);
+    without it, ssim() runs at half resolution (~7 ms, full-res would double step time).
+    """
+    if fused_ssim is not None and rendered.is_cuda:
+        nchw = lambda t: t.float().permute(0, 3, 1, 2).contiguous()
+        return fused_ssim(nchw(rendered), nchw(target))
+    half = lambda t: F.avg_pool2d(t.float().permute(0, 3, 1, 2), 2).permute(0, 2, 3, 1)
+    return ssim(half(rendered), half(target))
+
+
+def _correct_poses(viewmats: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
+    """Apply per-view corrections (axis-angle rotation, translation) in camera space."""
+    omega, t = deltas[:, :3], deltas[:, 3:]
+    theta = omega.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    k = omega / theta
+    K = torch.zeros(len(deltas), 3, 3, device=deltas.device, dtype=deltas.dtype)
+    K[:, 0, 1], K[:, 0, 2], K[:, 1, 2] = -k[:, 2], k[:, 1], -k[:, 0]
+    K = K - K.transpose(1, 2)
+    s, c = theta.sin()[..., None], theta.cos()[..., None]
+    R = torch.eye(3, device=deltas.device, dtype=deltas.dtype) + s * K + (1 - c) * (K @ K)
+    correction = torch.eye(4, device=deltas.device, dtype=deltas.dtype).repeat(len(deltas), 1, 1)
+    correction[:, :3, :3], correction[:, :3, 3] = R, t
+    return correction @ viewmats
 
 
 def _scene_scale(viewmats: torch.Tensor) -> float:
@@ -675,6 +708,11 @@ def train_splats(
     scale_means_lr: bool = True,
     base_targets: torch.Tensor | None = None,
     enhance=None,
+    densify: str = "voxel",
+    max_gaussians: int = 1_000_000,
+    refine_every: int = 100,
+    pose_opt: bool = False,
+    pose_lr: float = 1e-4,
 ) -> dict[str, torch.Tensor]:
     if steps < 1:
         raise ValueError("--steps must be at least 1")
@@ -684,6 +722,12 @@ def train_splats(
         raise ValueError("--voxel-stride must be at least 1")
     if not 0 <= ssim_weight <= 1:
         raise ValueError("--ssim-weight must be between 0 and 1")
+    if densify not in ("voxel", "mcmc"):
+        raise ValueError("--densify must be 'voxel' or 'mcmc'")
+    if max_gaussians < 1 or refine_every < 1:
+        raise ValueError("--max-gaussians and --refine-every must be at least 1")
+    if densify == "mcmc" and device != "cuda":
+        raise ValueError("MCMC densification needs CUDA (gsplat's relocation kernels)")
     quality_config = voxel_config or VoxelGuidedConfig()
     if quality_config.max_axis_ratio < 1 or quality_config.scale_regularization < 0:
         raise ValueError("Scale ratio must be >= 1 and regularization must be >= 0")
@@ -748,13 +792,32 @@ def train_splats(
         # Positions are learned in scene units; COLMAP's scale is arbitrary.
         means_lr_init = means_lr_init * _scene_scale(data["viewmats"])
     num_views = len(images) if target_all is None else target_all.shape[0]
-    optimizer = torch.optim.Adam([
-        {"params": [means], "lr": means_lr_init, "name": "means"},
-        {"params": [colors], "lr": 2.5e-3, "name": "colors"},
-        {"params": [scales], "lr": 5e-3, "name": "scales"},
-        {"params": [quats], "lr": 1e-3, "name": "quats"},
-        {"params": [opacities], "lr": 5e-2, "name": "opacities"},
-    ])
+    learning_rates = {"means": means_lr_init, "colors": 2.5e-3, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2}
+    mcmc = densify == "mcmc"
+    if mcmc:
+        # MCMC (Kheradmand et al. 2024): relocate near-transparent Gaussians to where
+        # opacity is high and grow 5% per refinement up to a fixed budget. gsplat's ops
+        # need one optimizer per named parameter.
+        params = torch.nn.ParameterDict({
+            "means": torch.nn.Parameter(means.detach()), "colors": torch.nn.Parameter(colors.detach()),
+            "scales": torch.nn.Parameter(scales.detach()), "quats": torch.nn.Parameter(quats.detach()),
+            "opacities": torch.nn.Parameter(opacities.detach()),
+        })
+        optimizers = {name: torch.optim.Adam([{"params": [params[name]], "lr": lr, "name": name}], eps=1e-15)
+                      for name, lr in learning_rates.items()}
+        # Growth stops at 80% of training so the last additions still get optimized.
+        strategy = MCMCStrategy(cap_max=max_gaussians, refine_start_iter=min(500, steps // 10),
+                                refine_stop_iter=int(0.8 * steps), refine_every=refine_every)
+        strategy.check_sanity(params, optimizers)
+        strategy_state = strategy.initialize_state()
+        means, colors, scales, quats, opacities = (params[k] for k in ("means", "colors", "scales", "quats", "opacities"))
+        optimizer = None
+        voxel_guided = False
+        opacity_reset_interval = 0
+    else:
+        optimizer = torch.optim.Adam([{"params": [t], "lr": learning_rates[name], "name": name} for name, t in
+                                      (("means", means), ("colors", colors), ("scales", scales),
+                                       ("quats", quats), ("opacities", opacities))])
     # An isolated SfM outlier must not set the scale ceiling for the whole scene.
     max_log_scale = float(np.log(np.quantile(mean_nn_dist, 0.95) * 20))
 
@@ -765,6 +828,12 @@ def train_splats(
         )
 
     use_amp = mixed_precision and device == "cuda"
+    pose_deltas = pose_optimizer = None
+    if pose_opt:
+        # Per-view pose corrections; translation is in scene units, so scale its step size.
+        pose_deltas = torch.zeros(num_views, 6, device=device, requires_grad=True)
+        pose_optimizer = torch.optim.Adam([pose_deltas], lr=pose_lr)
+        pose_scale = torch.tensor([1., 1., 1., *[_scene_scale(data["viewmats"])] * 3], device=device)
 
     last_preview = 0.0
     last_percent = -1
@@ -842,12 +911,16 @@ def train_splats(
                 raise ValueError("SR target dimensions do not match the render cameras")
         viewmats = viewmats_all[idx_dev]
         Ks = Ks_all[idx_dev]
+        if pose_deltas is not None:
+            pose_optimizer.zero_grad(set_to_none=True)
+            viewmats = _correct_poses(viewmats, pose_deltas[idx_dev] * pose_scale)
 
-        for group in optimizer.param_groups:
-            if group["name"] == "means":
-                group["lr"] = _means_lr(step, steps, means_lr_init, means_lr_final_ratio)
-
-        optimizer.zero_grad(set_to_none=True)
+        means_lr = _means_lr(step, steps, means_lr_init, means_lr_final_ratio)
+        for opt in (optimizers.values() if mcmc else (optimizer,)):
+            for group in opt.param_groups:
+                if group["name"] == "means":
+                    group["lr"] = means_lr
+            opt.zero_grad(set_to_none=True)
         quats_n = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         scales_c = scales.clamp(max=max_log_scale)
 
@@ -859,14 +932,15 @@ def train_splats(
             loss = (torch.abs(rendered - target).mean() if base_target is None else
                     sr_training_loss(rendered, target, base_target, sr_prior_weight))
         if ssim_weight and base_target is None:
-            # Half resolution keeps SSIM ~4x cheaper (full-res roughly doubles step time);
-            # it runs outside autocast because it subtracts near-equal moments.
-            half = lambda t: F.avg_pool2d(t.float().permute(0, 3, 1, 2), 2).permute(0, 2, 3, 1)
-            loss = (1 - ssim_weight) * loss + ssim_weight * (1 - ssim(half(rendered), half(target)))
+            loss = (1 - ssim_weight) * loss + ssim_weight * (1 - _training_ssim(rendered, target))
         if quality_config.scale_regularization:
             loss = loss + quality_config.scale_regularization * _scale_regularizer(
                 scales, quality_config.max_axis_ratio
             )
+        if mcmc:
+            # The paper's regularizers keep Gaussians small and let unneeded ones fade,
+            # which is what frees them for relocation.
+            loss = loss + 0.01 * opacities.sigmoid().mean() + 0.01 * scales_c.exp().mean()
         loss.backward()
 
         if voxel_opt is not None:
@@ -879,7 +953,15 @@ def train_splats(
                 voxel_opt.accumulate_step(means)
             voxel_opt.dampen_gradients(means, scales, colors, quats, opacities)
 
-        optimizer.step()
+        if pose_optimizer is not None:
+            pose_optimizer.step()
+        if mcmc:
+            for opt in optimizers.values():
+                opt.step()
+            strategy.step_post_backward(params, optimizers, strategy_state, step, render_info, lr=means_lr)
+            means, colors, scales, quats, opacities = (params[k] for k in ("means", "colors", "scales", "quats", "opacities"))
+        else:
+            optimizer.step()
 
         if voxel_opt is not None:
             means, colors, scales, quats, opacities = voxel_opt.maybe_densify_and_prune(
@@ -906,6 +988,7 @@ def train_splats(
         scales.copy_(scales.clamp(max=max_log_scale))
 
     result = {
+        **({"pose_deltas": (pose_deltas.detach() * pose_scale).cpu()} if pose_deltas is not None else {}),
         "clip_bounds": clip_bounds,
         "clip_axes": clip_axes,
         "means": means.detach().cpu(),
@@ -965,7 +1048,7 @@ def build_model(
     output: Path,
     every: int = 5,
     max_width: int = 1920,
-    steps: int = 3500,
+    steps: int = 5000,
     device: str = "cuda",
     view_batch_size: int | None = None,
     max_points: int = 150_000,
@@ -1002,6 +1085,9 @@ def build_model(
     eval_every: int = 0,
     ssim_weight: float = 0.2,
     scale_means_lr: bool = True,
+    densify: str = "mcmc",
+    refine_every: int = 50,
+    max_gaussians: int = 1_000_000,
 ) -> Path:
     if mapper_tracks_per_view is not None and mapper_tracks_per_view < 0:
         raise ValueError('--mapper-tracks-per-view must be >= 0')
@@ -1118,6 +1204,7 @@ def build_model(
             sr_prior_weight=sr_prior_weight, targets=targets, voxel_stride=voxel_stride,
             **sr_inputs,
             ssim_weight=ssim_weight, scale_means_lr=scale_means_lr,
+            densify=densify, refine_every=refine_every, max_gaussians=max_gaussians,
         )
         if held_out is not None:
             quality = evaluate_views(result, *held_out, width, height, device)
@@ -1180,12 +1267,19 @@ def main() -> None:
     parser.add_argument("--no-colmap-cache", dest="colmap_cache", action="store_false",
                         help="Always re-run COLMAP even if inputs and settings are unchanged.")
     parser.add_argument("--max-width", type=int, default=1920)
-    parser.add_argument("--steps", type=int, default=3500)
+    parser.add_argument("--steps", type=int, default=5000,
+                        help="Training steps (default 5000: ~8 min for ~1800 video frames at 1280 px with MCMC).")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--view-batch-size", type=int, default=None,
                         help="Defaults to 1 with SR, otherwise 4.")
     parser.add_argument("--max-points", type=int, default=200_000)
-    parser.add_argument("--max-gaussians", type=int, default=200_000)
+    parser.add_argument("--densify", choices=("mcmc", "voxel"), default="mcmc",
+                        help="mcmc: relocate/grow Gaussians up to --max-gaussians (3DGS-MCMC); "
+                             "voxel: the earlier DroneSplat-style voxel growth.")
+    parser.add_argument("--max-gaussians", type=int, default=1_000_000,
+                        help="Gaussian budget (MCMC cap, and the voxel method's limit).")
+    parser.add_argument("--refine-every", type=int, default=50,
+                        help="MCMC: relocate and grow (by 5%%) every N steps.")
     parser.add_argument("--max-axis-ratio", type=float, default=10.0,
                         help="Axis ratio above which splats receive a soft shape penalty.")
     parser.add_argument("--scale-regularization", type=float, default=0.01,
@@ -1312,6 +1406,7 @@ def main() -> None:
             mapper_tracks_per_view=args.mapper_tracks_per_view,
             eval_every=args.eval_every, ssim_weight=args.ssim_weight,
             scale_means_lr=args.scale_means_lr,
+            densify=args.densify, refine_every=args.refine_every, max_gaussians=args.max_gaussians,
         ),
         flush=True
     )

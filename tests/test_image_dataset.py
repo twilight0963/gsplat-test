@@ -25,13 +25,45 @@ class ImageDatasetTests(unittest.TestCase):
                 exif[34665] = {36867: time, 37386: 8.8}
                 exif[34853] = {1: 'N', 2: (37., 59., 0.), 3: 'W', 4: (122., 3., 0.)}
                 Image.new('RGB', (100, 80)).save(source / name, exif=exif, xmp=xmp)
+            # No downscaling needed: originals are copied byte-for-byte.
+            for max_width in (0, 100, 200):
+                result = prepare_image_dataset(source, root / f'full{max_width}', max_width)
+                self.assertEqual(result.camera_params, '80.0,50.0,40.0,0.0')
+                self.assertEqual((result.capture / 'frame_000000.jpg').read_bytes(), (source / 'b.jpg').read_bytes())
+                self.assertEqual(read_photo(result.capture / 'frame_000000.jpg').calibration, (80., 50., 40.))
+            # Wider than --max-width: staged once at half size, intrinsics scaled to match.
             result = prepare_image_dataset(source, root / 'out', 50)
-            self.assertEqual(result.camera_params, '80.0,50.0,40.0,0.0')
+            self.assertEqual(result.camera_params, '40.0,25.0,20.0,0.0')
             self.assertTrue(result.spatial)
             self.assertEqual(result.max_image_size, 50)
-            self.assertEqual((result.capture / 'frame_000000.jpg').read_bytes(), (source / 'b.jpg').read_bytes())
-            self.assertEqual(read_photo(result.capture / 'frame_000000.jpg').calibration, (80., 50., 40.))
-            self.assertEqual(len(json.loads((root/'out/photo_metadata.json').read_text())), 2)
+            staged = read_photo(result.capture / 'frame_000000.jpg')
+            self.assertEqual(staged.size, (50, 40))
+            self.assertTrue(staged.gps)
+            self.assertEqual(staged.timestamp, '2020:01:01 12:01:00')  # b.jpg sorts first by time
+            self.assertNotEqual((result.capture / 'frame_000000.jpg').read_bytes(), (source / 'b.jpg').read_bytes())
+            mapping = json.loads((root/'out/photo_metadata.json').read_text())
+            self.assertEqual([m['scale'] for m in mapping], [.5, .5])
+            self.assertEqual(mapping[0]['calibration'], [80., 50., 40.])
+
+    def test_downscaled_png_and_tiff_keep_gps(self):
+        for suffix in ('.png', '.tif'):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / 'input'
+                source.mkdir()
+                exif = Image.Exif()
+                exif[34853] = {1: 'N', 2: (37., 59., 0.), 3: 'W', 4: (122., 3., 0.)}
+                for name in ('a', 'b'):
+                    # EXIF as bytes: the form a camera file carries (and Pillow can write to TIFF).
+                    Image.new('RGB', (120, 60), (10, 20, 30)).save(source / (name + suffix), exif=exif.tobytes())
+                result = prepare_image_dataset(source, root / 'out', 60)
+                self.assertTrue(read_photo(source / ('a' + suffix)).gps)
+                staged = read_photo(result.capture / f'frame_000000{suffix}')
+                self.assertEqual(staged.size, (60, 30))
+                with Image.open(result.capture / f'frame_000000{suffix}') as image:
+                    self.assertEqual(image.getpixel((5, 5)), (10, 20, 30))
+                self.assertTrue(staged.gps)
+                self.assertTrue(result.spatial)
 
     def test_missing_metadata_and_mixed_sizes(self):
         with tempfile.TemporaryDirectory() as tmp:

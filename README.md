@@ -82,12 +82,39 @@ the same registration, reprojection error and held-out PSNR.
 
 ### Training quality
 
-Training uses L1 plus a D-SSIM term (`--ssim-weight`, default 0.2, evaluated at
-half resolution for speed; `0` restores pure L1) and scales the position learning
+Training uses L1 plus a D-SSIM term (`--ssim-weight`, default 0.2; `0` restores
+pure L1). With the optional fused CUDA SSIM kernel installed, the term runs at full
+resolution in ~3 ms per step; without it, it falls back to a PyTorch SSIM at half
+resolution (~7 ms). Install the kernel into the venv (needs the CUDA toolkit):
+
+```bash
+CUDA_HOME=/opt/cuda .venv/bin/python -m pip install --no-build-isolation \
+  "git+https://github.com/rahul-goel/fused-ssim@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38"
+```
+
+Training also scales the position learning
 rate by the camera extent, as in 3DGS (`--no-scale-means-lr` disables it). Use
 `--eval-every 8` to hold out every 8th registered view and report PSNR/SSIM in
 `benchmark.log`/`benchmark.json` under `quality`; held-out views are not trained on,
 so leave it off for production models.
+
+Densification defaults to 3DGS-MCMC (`--densify mcmc`, gsplat's `MCMCStrategy`):
+near-transparent Gaussians are relocated to where opacity is high and the count
+grows 5% every `--refine-every` steps (default 50) up to `--max-gaussians`
+(default 1,000,000), stopping at 80% of training. COLMAP points alone are far too
+few (a single training view could only reach ~24 dB PSNR; with MCMC it reaches
+~39 dB). On a 1800-frame drone clip (66 keyframes, 1280 px, held out every 8th
+view), 5000 steps (the default) gave:
+
+| Densification | Training | Held-out PSNR | Gaussians |
+|---|---|---|---|
+| voxel (previous default) | 185 s | 19.8 dB | 20k |
+| MCMC, refine every 100 | 246 s | 22.3 dB | 126k |
+| MCMC, refine every 50 (default) | 461 s | 24.4 dB | 697k |
+
+Training time grows with image size; 1920 px frames have 2.25x the pixels of 1280 px,
+so expect roughly twice the training time (estimate, not measured).
+`--densify voxel` restores the earlier DroneSplat-style voxel growth. MCMC needs CUDA.
 
 Absolute geographic accuracy is reported as **unverified**. Photo EXIF GPS is
 used for neighbor matching, not an implemented geographic alignment or checkpoint
@@ -115,9 +142,12 @@ The engine also accepts a directory of JPEG, PNG or TIFF photographs:
 
 All photos directly inside the directory are used; `--every` applies only to
 video. Use a new output directory and photos with consistent dimensions and
-upright EXIF orientation. The originals are copied byte-for-byte into
-`capture/photos`, preserving EXIF and DJI XMP; `photo_metadata.json` records the
-source-to-capture mapping. Files are ordered by capture time when every image has
+upright EXIF orientation. Photos wider than `--max-width` are written once at that
+width into `capture/photos` (Lanczos, JPEG quality 95), keeping EXIF (GPS, focal
+length); otherwise the originals are copied byte-for-byte. Staging once means COLMAP
+never decodes full-size originals: on 305 8192 px photos, feature extraction went
+from 88 s to 7 s and undistortion from 124 s to 3 s. `photo_metadata.json` records
+the source-to-capture mapping and scale. Files are ordered by capture time when every image has
 a timestamp, otherwise by filename.
 
 When all photos have valid EXIF GPS, auto matching combines 20 GPS neighbors per
@@ -130,9 +160,8 @@ it is not treated as exact geometry, and gimbal angles are not imposed as poses.
 Consistent DJI calibrated focal length and optical center seed a shared
 SIMPLE_RADIAL camera, with lens distortion and focal length still refined by
 COLMAP. If calibration is missing or differs, COLMAP estimates the appropriate
-parameters instead. Metadata is read at original resolution: feature extraction
-and undistortion apply the image-size limit inside COLMAP so camera coordinates
-remain consistent. For portrait photos the equivalent longest-side limit is used.
+parameters instead. Metadata is read from the originals; the DJI calibration is
+scaled to the staged size, so camera coordinates stay consistent. For portrait photos the equivalent longest-side limit is used.
 Brightness/contrast, unsharp masking and CAS run on the undistorted training
 targets. `--super-resolution` also works with photo directories; its 2x targets
 and base-image loss use the same undistorted cameras.

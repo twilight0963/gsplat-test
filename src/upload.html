@@ -3,7 +3,7 @@
 <main><h1>Fly-By Render</h1><p>Choose your settings and build a 3D Reconstruction.</p>
 <form id="form">
 <label class="wide">Input video<input name="video" type="file" accept="video/*,.mkv,.avi,.mov,.mp4" required></label>
-<label>Training steps<input name="steps" type="number" value="2000" min="1" max="1000000" required><small>Steps improves the general quality and detail level.</small></label>
+<label>Training steps<input name="steps" type="number" value="5000" min="1" max="1000000" required><small>Steps improves the general quality and detail level.</small></label>
 <label>Keep every Nth frame<input name="every" type="number" value="5" min="1" max="100000" required><small>Lower values require higher processing.</small></label>
 <label>Maximum width<input name="max-width" type="number" value="1920" min="0" max="16384" required><small>Input width limit. With SR, training images are twice this width; start with 640 on a 6 GB GPU.</small></label>
 <label>Output folder<input name="output" required pattern="runs/.+"><small>Folder contains capture images, colmap data, and model.</small></label>

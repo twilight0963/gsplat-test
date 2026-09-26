@@ -32,3 +32,19 @@ class TrainingLossTests(unittest.TestCase):
             out = engine.build_targets_gpu([Path(f'{i}.jpg') for i in range(20)], 0, 1, False, .5, 'cpu')
         self.assertEqual(tuple(out.shape), (20, 1080, 1920, 3))
         self.assertEqual(sizes, [7, 7, 6])  # 16M-pixel budget, not a fixed 32 frames
+
+    def test_training_ssim_uses_fused_kernel_on_cuda_and_falls_back_elsewhere(self):
+        from unittest.mock import Mock, patch
+        x, y = torch.rand(1, 8, 10, 3), torch.rand(1, 8, 10, 3)
+        fused = Mock(return_value=torch.tensor(.5))
+        with patch.object(engine, 'fused_ssim', fused):
+            # CPU tensors never reach the CUDA kernel.
+            half = torch.nn.functional.avg_pool2d
+            expected = engine.ssim(half(x.permute(0, 3, 1, 2), 2).permute(0, 2, 3, 1),
+                                   half(y.permute(0, 3, 1, 2), 2).permute(0, 2, 3, 1))
+            torch.testing.assert_close(engine._training_ssim(x, y), expected)
+            fused.assert_not_called()
+        if torch.cuda.is_available():
+            with patch.object(engine, 'fused_ssim', fused):
+                self.assertEqual(float(engine._training_ssim(x.cuda(), y.cuda())), .5)
+            self.assertEqual(fused.call_args.args[0].shape, (1, 3, 8, 10))

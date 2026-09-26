@@ -105,7 +105,8 @@ def benchmark_run(function):
                 'super_resolution', 'sr_tile', 'sr_prior_weight', 'sharpness', 'brightness',
                 'contrast', 'image_matching', 'spatial_neighbors', 'use_server', 'keyframe_max_gap', 'keyframe_motion',
                 'sequential_overlap', 'max_features', 'gp_iterations', 'ba_iterations', 'colmap_cache', 'photo_every', 'headless',
-                'mapper_tracks_per_view', 'eval_every', 'ssim_weight', 'scale_means_lr')},
+                'mapper_tracks_per_view', 'eval_every', 'ssim_weight', 'scale_means_lr',
+                'densify', 'refine_every', 'max_gaussians')},
         }
         report['settings']['vocab_tree'] = str(options['vocab_tree']) if options['vocab_tree'] else None
         report['settings']['view_batch_size'] = options['view_batch_size'] or (1 if options['super_resolution'] else 4)
