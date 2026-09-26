@@ -1,36 +1,341 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Drone video to 3D</title>
-<style>body{font:16px system-ui;background:#101720;color:#eef3f9;margin:0}main{max-width:760px;margin:40px auto;padding:24px}h1{font-size:30px}form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}label{display:grid;gap:7px}input,button,select{font:inherit;padding:12px;border:1px solid #526174;border-radius:8px;background:#1c2838;color:inherit}small{color:#b6c4d4}.wide{grid-column:1/-1}button{background:#2867c7;cursor:pointer}button:disabled{opacity:.5}#status{white-space:pre-wrap;overflow-wrap:anywhere;padding:20px;background:#1c2838;border-radius:8px}a{color:#8fc0ff}progress{width:100%}@media(max-width:500px){form{grid-template-columns:1fr}.wide{grid-column:auto}}</style>
-<main><h1>Fly-By Render</h1><p>Choose your settings and build a 3D Reconstruction.</p>
-<form id="form">
-<label class="wide">Input video<input name="video" type="file" accept="video/*,.mkv,.avi,.mov,.mp4" required></label>
-<label>Training steps<input name="steps" type="number" value="5000" min="1" max="1000000" required><small>Steps improves the general quality and detail level.</small></label>
-<label>Keep every Nth frame<input name="every" type="number" value="5" min="1" max="100000" required><small>Lower values require higher processing.</small></label>
-<label>Maximum width<input name="max-width" type="number" value="1920" min="0" max="16384" required><small>Input width limit. With SR, training images are twice this width; start with 640 on a 6 GB GPU.</small></label>
-<label>Output folder<input name="output" required pattern="runs/.+"><small>Folder contains capture images, colmap data, and model.</small></label>
-<label>Brightness<input name="brightness" type="number" value="0" min="-255" max="255" step="any" required><small>Additive pixel offset</small></label>
-<label>Contrast<input name="contrast" type="number" value="1" min="0" max="10" step="any" required><small>Contrast multiplier</small></label>
-<label>CAS-Effectiveness<input name="sharpness" type="number" value="0.5" min="0" max="1" step="any" required><small>CAS sharpening multiplier</small></label>
-<label>Unsharp masking<select name="unsharp"><option value="auto">Automatic (off with SR)</option><option value="off">Off</option><option value="on">On</option></select><small>CAS remains active. Extra sharpening can amplify noise.</small></label>
-<label class="wide">Super-resolution<select name="super-resolution" id="sr-mode"><option value="false">Off — existing pipeline</option><option value="true">On — SwinIR 2× + CAS</option></select><small>Uses one camera per training step and preserves brightness/contrast. Requires SwinIR setup on the server.</small></label>
-<label>SR tile size<input name="sr-tile" type="number" value="128" min="32" max="512" step="8" disabled required><small>Smaller tiles use less GPU memory.</small></label>
-<label>Enhanced-image weight<input name="sr-prior-weight" type="number" value="0.5" min="0" max="1" step="0.05" disabled required><small>The remaining weight keeps downsampled renders close to the base images.</small></label>
-<button class="wide" id="build">Upload & build</button></form>
-<p id="upload"></p><progress id="progress" max="100" value="0" hidden></progress>
-<h2>Current activity</h2><div id="status" role="status" aria-live="polite">Ready to upload!</div>
-<p><small>Keep this page open to launch the viewer automatically.</small></p></main>
-<p><a id="viewer" target="_blank" rel="noopener" hidden>Or click here to open viewer</a></p>
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flyby Render — Upload</title>
+<style>
+/* Catppuccin Latte (catppuccin.com/palette) */
+:root{--rosewater:#dc8a78;--mauve:#8839ef;--red:#d20f39;--maroon:#e64553;--peach:#fe640b;--yellow:#df8e1d;--green:#40a02b;--teal:#179299;--blue:#1e66f5;--lavender:#7287fd;
+--text:#4c4f69;--subtext1:#5c5f77;--subtext0:#6c6f85;--overlay2:#7c7f93;--overlay1:#8c8fa1;--overlay0:#9ca0b0;--surface2:#acb0be;--surface1:#bcc0cc;--surface0:#ccd0da;--base:#eff1f5;--mantle:#e6e9ef;--crust:#dce0e8;
+--accent:var(--mauve);--accent-hover:#7832d2;--accent-tint:#f3ebfd;--radius:14px;--field-h:2.75rem;--ease:cubic-bezier(.2,.8,.2,1)}
+*{box-sizing:border-box}
+html{font:100%/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);background:var(--base)}
+body{margin:0;min-height:100vh}
+[hidden]{display:none!important}
+a{color:var(--accent)}
+h1,h2,h3{margin:0;font-weight:650}
+h1{font-size:clamp(1.6rem,3vw,2.1rem);line-height:1.1;letter-spacing:-.02em}
+h2{font-size:1.05rem;line-height:1.3;letter-spacing:-.01em}
+small,.hint{color:var(--subtext0);font-size:.8125rem;line-height:1.4}
+.topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.85rem clamp(1rem,4vw,2.5rem);
+ background:rgba(239,241,245,.78);backdrop-filter:blur(18px) saturate(170%);-webkit-backdrop-filter:blur(18px) saturate(170%);box-shadow:0 1px 0 rgba(76,79,105,.08)}
+.brand{display:flex;align-items:center;gap:.75rem}
+.brand svg{flex:none}
+.brand p{margin:.1rem 0 0;color:var(--subtext0);font-size:.875rem}
+.layout{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:1.5rem;align-items:start;max-width:1180px;margin:0 auto;padding:1.5rem clamp(1rem,4vw,2.5rem) 3rem}
+@media(max-width:900px){.layout{grid-template-columns:1fr}}
+.card{background:#fff;border:1px solid var(--crust);border-radius:var(--radius);padding:1.25rem 1.35rem;box-shadow:0 1px 2px rgba(76,79,105,.06),0 6px 20px rgba(76,79,105,.05)}
+.card+.card{margin-top:1.25rem}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1rem;flex-wrap:wrap}
+.step-no{display:inline-grid;place-items:center;width:1.5rem;height:1.5rem;margin-right:.5rem;border-radius:50%;background:var(--mantle);color:var(--subtext1);font-size:.8rem;font-weight:700;vertical-align:1px}
+/* Segmented control */
+.segmented{display:inline-flex;padding:3px;border-radius:10px;background:var(--mantle);border:1px solid var(--crust)}
+.segmented input{position:absolute;opacity:0;pointer-events:none}
+.segmented label{padding:.4rem .95rem;border-radius:8px;font-size:.9rem;font-weight:550;color:var(--subtext1);cursor:pointer;transition:background .15s var(--ease),color .15s var(--ease)}
+.segmented input:checked+label{background:#fff;color:var(--text);box-shadow:0 1px 3px rgba(76,79,105,.18)}
+.segmented input:focus-visible+label{outline:2px solid var(--lavender);outline-offset:2px}
+/* Drop zone */
+.drop{display:grid;justify-items:center;gap:.6rem;padding:1.6rem 1rem;border:1.5px dashed var(--surface1);border-radius:12px;background:var(--base);text-align:center;transition:border-color .15s var(--ease),background .15s var(--ease),transform .15s var(--ease)}
+.drop.over{border-color:var(--accent);background:var(--accent-tint);transform:scale(1.01)}
+.drop:focus-visible{outline:2px solid var(--lavender);outline-offset:3px}
+.drop-icon{width:2.6rem;height:2.6rem;color:var(--accent)}
+.drop strong{font-size:1rem;font-weight:600}
+.drop-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:.5rem;margin-top:.2rem}
+.selection{display:flex;align-items:center;gap:.6rem;margin-top:.9rem;padding:.65rem .85rem;border-radius:10px;background:var(--mantle);font-size:.9rem}
+.selection.ok{background:#e3f1e0}
+.selection.error{background:#fbe3e7;color:#a30b2d}
+.selection .dot{flex:none;width:.55rem;height:.55rem;border-radius:50%;background:var(--overlay0)}
+.selection.ok .dot{background:var(--green)}
+.selection.error .dot{background:var(--red)}
+/* Fields */
+.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem 1.25rem}
+@media(max-width:560px){.fields{grid-template-columns:1fr}}
+.field{display:grid;grid-template-rows:auto var(--field-h) auto;gap:.35rem;align-content:start}
+.field>span{font-size:.875rem;font-weight:600;color:var(--text)}
+.field .unit{font-weight:450;color:var(--subtext0)}
+input,select,button{font:inherit;color:inherit}
+input[type=number],input[type=text],select{width:100%;height:var(--field-h);padding:0 .8rem;border:1px solid var(--surface0);border-radius:10px;background:#fff;transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}
+input:hover,select:hover{border-color:var(--surface2)}
+input:focus-visible,select:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(136,57,239,.2)}
+input:disabled,select:disabled{background:var(--mantle);color:var(--overlay1)}
+input.invalid{border-color:var(--red);box-shadow:0 0 0 3px rgba(210,15,57,.14)}
+details.more{margin-top:1.1rem;border-top:1px solid var(--crust);padding-top:.9rem}
+details.more summary{display:flex;align-items:center;gap:.5rem;cursor:pointer;list-style:none;font-weight:600;font-size:.95rem;border-radius:8px;padding:.2rem 0}
+details.more summary::-webkit-details-marker{display:none}
+details.more summary::before{content:"";width:.5rem;height:.5rem;border-right:2px solid var(--overlay1);border-bottom:2px solid var(--overlay1);transform:rotate(-45deg);transition:transform .2s var(--ease)}
+details.more[open] summary::before{transform:rotate(45deg)}
+details.more summary .hint{font-weight:450;margin-left:auto}
+details.more summary:focus-visible{outline:2px solid var(--lavender);outline-offset:3px}
+details.more .fields{margin-top:.9rem}
+.switch{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-top:.9rem;padding:.75rem .9rem;border-radius:10px;background:var(--base)}
+.switch input{appearance:none;flex:none;width:2.6rem;height:1.55rem;border-radius:1rem;background:var(--surface1);position:relative;cursor:pointer;transition:background .2s var(--ease)}
+.switch input::after{content:"";position:absolute;top:3px;left:3px;width:1.2rem;height:1.2rem;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(76,79,105,.3);transition:transform .2s var(--ease)}
+.switch input:checked{background:var(--green)}
+.switch input:checked::after{transform:translateX(1.05rem)}
+.switch input:focus-visible{outline:2px solid var(--lavender);outline-offset:2px}
+/* Buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.45rem;min-height:2.5rem;padding:0 1rem;border-radius:10px;border:1px solid var(--surface0);background:#fff;font-weight:600;font-size:.925rem;cursor:pointer;text-decoration:none;color:var(--text);transition:transform .1s ease-out,background .15s var(--ease),border-color .15s var(--ease)}
+.btn:hover{background:var(--base);border-color:var(--surface1)}
+.btn:active{transform:scale(.97)}
+.btn:focus-visible{outline:2px solid var(--lavender);outline-offset:2px}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent-hover)}
+.btn.danger{color:var(--red);border-color:#f0b7c3}
+.btn.danger:hover{background:#fdecef}
+.btn.danger.confirm{background:var(--red);border-color:var(--red);color:#fff}
+.btn.large{min-height:3rem;padding:0 1.4rem;font-size:1rem}
+.btn[aria-disabled=true]{opacity:.45;pointer-events:none}
+.submit-row{display:flex;align-items:center;gap:1rem;margin-top:1.25rem;flex-wrap:wrap}
+.submit-row .hint{flex:1;min-width:12rem}
+/* Progress panel */
+.job{position:sticky;top:5.25rem}
+@media(max-width:900px){.job{position:static}}
+.stages{display:grid;grid-template-columns:repeat(5,1fr);gap:.35rem;margin:0 0 1rem;padding:0;list-style:none}
+.stages li{display:grid;justify-items:center;gap:.35rem;font-size:.75rem;color:var(--subtext0);text-align:center}
+.stages li::before{content:"";width:100%;height:4px;border-radius:2px;background:var(--crust);transition:background .25s var(--ease)}
+.stages li.done{color:var(--subtext1)}.stages li.done::before{background:var(--green)}
+.stages li.active{color:var(--text);font-weight:650}.stages li.active::before{background:var(--accent)}
+.stages li.failed{color:var(--red);font-weight:650}.stages li.failed::before{background:var(--red)}
+.meter{height:.6rem;border-radius:.3rem;background:var(--mantle);overflow:hidden}
+.meter>div{height:100%;width:0;border-radius:inherit;background:var(--accent);transition:width .3s var(--ease)}
+.meter.indeterminate>div{width:35%;animation:slide 1.3s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(290%)}}
+.meter-row{display:flex;justify-content:space-between;gap:1rem;margin-top:.45rem;font-size:.8125rem;color:var(--subtext0);font-variant-numeric:tabular-nums}
+.headline{margin:0 0 .75rem;font-size:1.25rem;font-weight:650;letter-spacing:-.015em}
+.log{margin:.9rem 0 0;padding:.7rem .8rem;border-radius:10px;background:var(--base);font:.8rem/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--subtext1);white-space:pre-wrap;overflow-wrap:anywhere;max-height:7.5rem;overflow:auto}
+.job-actions{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1rem}
+.notice{margin-top:.8rem;font-size:.875rem;color:var(--subtext1)}
+.notice.error{color:#a30b2d}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}.btn:active{transform:none}.drop.over{transform:none}.meter.indeterminate>div{width:100%;opacity:.35}}
+@media(prefers-reduced-transparency:reduce){.topbar{background:var(--base);backdrop-filter:none;-webkit-backdrop-filter:none}}
+@media(prefers-contrast:more){.card,input,select,.btn{border-color:var(--overlay2)}}
+</style>
+<header class="topbar">
+ <div class="brand">
+  <svg width="36" height="36" viewBox="0 0 36 36" aria-hidden="true"><rect width="36" height="36" rx="10" fill="#8839ef"/><path d="M8 23l6-8 5 5 4-6 5 9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="25" cy="11" r="2.4" fill="#fff"/></svg>
+  <div><h1>Flyby Render</h1><p>Drone video or photos → 3D Gaussian splat model</p></div>
+ </div>
+ <a class="btn" id="viewer" target="flyby-viewer" aria-disabled="true" title="Available once training starts">Open viewer ↗</a>
+</header>
+<main class="layout">
+<form id="form" novalidate>
+ <section class="card" aria-labelledby="input-title">
+  <div class="card-head">
+   <h2 id="input-title"><span class="step-no">1</span>Input</h2>
+   <div class="segmented" role="radiogroup" aria-label="Input type">
+    <input type="radio" name="input-mode" id="mode-video" value="video" checked><label for="mode-video">Video</label>
+    <input type="radio" name="input-mode" id="mode-photos" value="photos"><label for="mode-photos">Photos</label>
+   </div>
+  </div>
+  <div class="drop" id="drop" tabindex="0" role="button" aria-describedby="drop-hint">
+   <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+   <strong id="drop-title">Drop a video here</strong>
+   <small id="drop-hint">…or a photo folder, anywhere on this page. A folder uses only the photos directly inside it, e.g. <code>Dataset/ATR/Images</code>.</small>
+   <div class="drop-actions">
+    <button type="button" class="btn" id="choose-video">Choose video…</button>
+    <button type="button" class="btn" id="choose-folder" hidden>Choose folder…</button>
+    <button type="button" class="btn" id="choose-photos" hidden>Select photos…</button>
+   </div>
+  </div>
+  <input name="video" type="file" accept="video/*,.mkv,.avi,.mov,.mp4" hidden>
+  <input name="photo-folder" type="file" webkitdirectory hidden>
+  <input name="photo-files" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff,image/jpeg,image/png,image/tiff" multiple hidden>
+  <div class="selection" id="selection" role="status" aria-live="polite"><span class="dot"></span><span id="selection-text">Nothing selected yet.</span></div>
+ </section>
+
+ <section class="card" aria-labelledby="settings-title">
+  <div class="card-head"><h2 id="settings-title"><span class="step-no">2</span>Settings</h2></div>
+  <div class="fields">
+   <label class="field"><span>Training steps</span><input name="steps" type="number" value="5000" min="1" max="1000000" required><small>More steps add detail; 5000 suits most flights.</small></label>
+   <label class="field" id="every-input"><span>Keep every Nth frame</span><input name="every" type="number" value="5" min="1" max="100000" required><small>Higher skips more frames and runs faster.</small></label>
+   <label class="field" id="photo-every-input" hidden><span>Use every Nth photo</span><input name="photo-every" type="number" value="2" min="1" max="1000" required disabled><small>1 uses all photos; matching time grows with the count.</small></label>
+   <label class="field"><span>Maximum width <span class="unit">px</span></span><input name="max-width" type="number" value="1920" min="0" max="16384" required><small>1280 trains about 2× faster than 1920. 0 keeps full size.</small></label>
+   <label class="field"><span>Output folder</span><input name="output" type="text" required pattern="runs/.+" spellcheck="false" autocomplete="off"><small>A new folder inside <code>runs/</code>.</small></label>
+  </div>
+  <details class="more">
+   <summary>Image adjustments <span class="hint">Brightness, contrast, sharpening</span></summary>
+   <div class="fields">
+    <label class="field"><span>Brightness</span><input name="brightness" type="number" value="0" min="-255" max="255" step="any" required><small>Added to every pixel (0 = unchanged).</small></label>
+    <label class="field"><span>Contrast</span><input name="contrast" type="number" value="1" min="0" max="10" step="any" required><small>Multiplier (1 = unchanged).</small></label>
+    <label class="field"><span>CAS sharpening</span><input name="sharpness" type="number" value="0.5" min="0" max="1" step="any" required><small>0–1. Applied to training images only.</small></label>
+    <label class="field"><span>Unsharp masking</span><select name="unsharp"><option value="auto">Automatic (off with SR)</option><option value="off">Off</option><option value="on">On</option></select><small>Extra sharpening can amplify noise.</small></label>
+   </div>
+  </details>
+  <details class="more">
+   <summary>Super-resolution <span class="hint" id="sr-summary">Off</span></summary>
+   <label class="switch"><span><strong>SwinIR 2× upscaling</strong><br><small>Trains on 2× images. Needs SwinIR on the server; slower.</small></span><input type="checkbox" name="super-resolution" role="switch"></label>
+   <div class="fields">
+    <label class="field"><span>SR tile size <span class="unit">px</span></span><input name="sr-tile" type="number" value="128" min="32" max="512" step="8" disabled required><small>Smaller tiles use less GPU memory.</small></label>
+    <label class="field"><span>Enhanced-image weight</span><input name="sr-prior-weight" type="number" value="0.5" min="0" max="1" step="0.05" disabled required><small>The rest keeps renders close to the originals.</small></label>
+   </div>
+  </details>
+  <div class="submit-row">
+   <button class="btn primary large" id="build">Upload &amp; build</button>
+   <span class="hint" id="submit-hint">Keep this page open; the viewer opens when training starts.</span>
+  </div>
+ </section>
+</form>
+
+<aside class="card job" aria-labelledby="job-title">
+ <div class="card-head"><h2 id="job-title">Progress</h2></div>
+ <ol class="stages" id="stages" aria-label="Pipeline stages">
+  <li data-stage="upload">Upload</li><li data-stage="prepare">Prepare</li><li data-stage="reconstruct">Reconstruct</li><li data-stage="train">Train</li><li data-stage="save">Save</li>
+ </ol>
+ <p class="headline" id="headline" role="status" aria-live="polite">Ready</p>
+ <div class="meter" id="meter" role="progressbar" aria-labelledby="headline" aria-valuemin="0" aria-valuemax="100"><div></div></div>
+ <div class="meter-row"><span id="meter-label">Waiting for an upload</span><span id="meter-value"></span></div>
+ <div class="job-actions">
+  <button type="button" class="btn" id="cancel-upload" hidden>Cancel upload</button>
+  <button type="button" class="btn" id="stop-save" hidden title="End training now and save the model trained so far">Stop &amp; save</button>
+  <button type="button" class="btn danger" id="discard" hidden title="End the job and delete its files">Discard</button>
+ </div>
+ <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+ <pre class="log" id="status" aria-label="Latest engine output">Ready to upload!</pre>
+</aside>
+</main>
 <script>
 const form=document.querySelector('#form'),statusBox=document.querySelector('#status'),build=document.querySelector('#build'),link=document.querySelector('#viewer');
+const $=selector=>document.querySelector(selector);
 form.elements.output.value='runs/web-'+new Date().toISOString().replace(/[:.]/g,'-');
 const viewerURL=new URL(location.href);viewerURL.port='8000';viewerURL.pathname='/';viewerURL.search='';viewerURL.hash='';link.href=viewerURL.href;
-form.elements['super-resolution'].onchange=()=>{const enabled=form.elements['super-resolution'].value==='true';for(const key of ['sr-tile','sr-prior-weight'])form.elements[key].disabled=!enabled;};
-let submitted=false,navigated=false,uploading=false,completionHandled=false;
-async function poll(){try{const r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();const s=await r.json();statusBox.textContent=s.status;build.disabled=uploading||s.busy;link.hidden=!s.viewer;if(submitted&&!uploading&&!s.busy&&s.saved&&!completionHandled){completionHandled=true;form.elements.output.value='runs/web-'+new Date().toISOString().replace(/[:.]/g,'-');document.querySelector('#upload').textContent='Model saved. Ready for another upload; the viewer remains open.';}if(submitted&&!uploading&&s.viewer&&!navigated){navigated=true;const tab=window.open(viewerURL.href,'_blank');if(tab){tab.opener=null;}else{link.textContent='Viewer ready — click here to open (automatic tab was blocked)';}}}catch{statusBox.textContent='Cannot reach the upload server. Check the terminal.';}setTimeout(poll,700);}poll();
-form.onsubmit=e=>{e.preventDefault();if(uploading)return;const file=form.elements.video.files[0];if(!file)return;const params=new URLSearchParams();for(const key of ['steps','every','max-width','output','brightness','contrast','sharpness','super-resolution','unsharp'])params.set(key,form.elements[key].value);if(form.elements['super-resolution'].value==='true'){for(const key of ['sr-tile','sr-prior-weight'])params.set(key,form.elements[key].value);}
-
- submitted=false;navigated=false;link.textContent='Open viewer';completionHandled=false;uploading=true;build.disabled=true;const progress=document.querySelector('#progress'),label=document.querySelector('#upload');progress.hidden=false;
- const xhr=new XMLHttpRequest();xhr.open('POST','/upload?'+params);xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.upload.onprogress=e=>{if(e.lengthComputable){progress.value=100*e.loaded/e.total;label.textContent='Uploading: '+progress.value.toFixed(1)+'%';}};
- xhr.onload=()=>{uploading=false;if(xhr.status===202){submitted=true;label.textContent='Upload complete. Processing video…';}else{let message='Upload failed';try{message=JSON.parse(xhr.responseText).error||message;}catch{}label.textContent=message;build.disabled=false;submitted=false;}};
- xhr.onerror=()=>{uploading=false;submitted=false;build.disabled=false;label.textContent='Upload connection failed.';};xhr.send(file);
-};
+// Selection feedback, shown under the drop zone.
+function showSelection(text,kind){const box=$('#selection');box.className='selection'+(kind?' '+kind:'');$('#selection-text').textContent=text;}
+// photo-upload-start
+const PHOTO_EXT=/\.(jpe?g|png|tiff?)$/i,VIDEO_EXT=/\.(mp4|mov|mkv|avi|m4v|webm)$/i;
+const isPhoto=name=>PHOTO_EXT.test(name)&&!name.startsWith('.');
+const isVideo=file=>(file.type||'').startsWith('video/')||VIDEO_EXT.test(file.name);
+// Photos directly inside a folder chosen with <input webkitdirectory>, whose paths are "folder/name".
+function directPhotos(files){return Array.from(files).filter(f=>isPhoto(f.name)&&f.webkitRelativePath.split('/').length===2);}
+// Photos directly inside a folder chosen with showDirectoryPicker(); subfolders are not opened.
+async function handlePhotos(dir){const files=[];for await(const entry of dir.values())if(entry.kind==='file'&&isPhoto(entry.name))files.push(await entry.getFile());return files;}
+// Photos directly inside a dropped folder. readEntries() returns batches (about 100), so read until empty.
+async function entryPhotos(dir){const reader=dir.createReader(),files=[];
+ for(;;){const batch=await new Promise((ok,fail)=>reader.readEntries(ok,fail));if(!batch.length)break;
+  for(const entry of batch)if(entry.isFile&&isPhoto(entry.name))files.push(await new Promise((ok,fail)=>entry.file(ok,fail)));}
+ return files;}
+// What a drop contains: one folder, one video, or photos. Entries and files must be captured
+// synchronously in the drop event, before any await.
+async function readDrop(entries,files){const dirs=entries.filter(e=>e&&e.isDirectory);
+ if(dirs.length){if(entries.length>1)throw Error('Drop one folder at a time: the folder that directly contains the photos.');
+  return {mode:'photos',name:dirs[0].name,files:await entryPhotos(dirs[0])};}
+ const videos=files.filter(isVideo);
+ if(videos.length){if(files.length>1)throw Error('Drop one video at a time.');return {mode:'video',name:videos[0].name,files:videos};}
+ return {mode:'photos',name:'',files};}
+function pickPhotos(files){const picked=Array.from(files).filter(f=>isPhoto(f.name));
+ const names=new Set();for(const f of picked){const key=f.name.toLowerCase();if(names.has(key))throw Error('Two selected photos share the name '+f.name);names.add(key);}
+ if(picked.length<2)throw Error('Found '+picked.length+' JPEG, PNG or TIFF photos; at least two are needed. Use the folder that directly contains the photos, e.g. Dataset/ATR/Images.');
+ return picked.sort((a,b)=>a.name<b.name?-1:a.name>b.name?1:0);}
+// Upload body: per photo, uint32 name length, UTF-8 name, uint64 size, then the file bytes (see upload_server.receive_photos).
+function photoBatch(files){const parts=[],encoder=new TextEncoder();for(const f of files){const name=encoder.encode(f.name);if(!name.length||name.length>255)throw Error('Photo file name is too long: '+f.name);const header=new DataView(new ArrayBuffer(12+name.length));header.setUint32(0,name.length);new Uint8Array(header.buffer,4,name.length).set(name);header.setBigUint64(4+name.length,BigInt(f.size));parts.push(header.buffer,f);}return new Blob(parts);}
+// photo-upload-end
+const modeInputs={video:['every-input'],photos:['photo-every-input']};
+function currentMode(){return form.elements['input-mode'].value;}
+function setMode(mode){if(mode)form.querySelector(`input[name="input-mode"][value="${mode}"]`).checked=true;const current=currentMode();
+ for(const [key,ids] of Object.entries(modeInputs))for(const id of ids){const box=document.getElementById(id);box.hidden=key!==current;for(const input of box.querySelectorAll('input'))input.disabled=key!==current;}
+ $('#choose-video').hidden=current!=='video';$('#choose-folder').hidden=current!=='photos';$('#choose-photos').hidden=current!=='photos';
+ $('#drop-title').textContent=current==='video'?'Drop a video here':'Drop a photo folder here';
+ refreshSelection();}
+for(const radio of form.querySelectorAll('input[name="input-mode"]'))radio.onchange=()=>setMode();
+let photoFiles=null,photoFolder='';
+function refreshSelection(){
+ if(currentMode()==='video'){const file=form.elements.video.files[0];
+  if(file)showSelection(`${file.name} · ${formatBytes(file.size)}`,'ok');else showSelection('No video selected yet.');return;}
+ if(!photoFiles){showSelection('No photos selected yet.');return;}
+ try{const picked=pickPhotos(photoFiles),bytes=picked.reduce((sum,f)=>sum+f.size,0);
+  showSelection(`${picked.length} photos${photoFolder?' in '+photoFolder:''} · ${formatBytes(bytes)} will be uploaded`,'ok');}catch(error){showSelection(error.message,'error');}}
+function formatBytes(n){const units=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return (i?n.toFixed(n<10?1:0):n)+' '+units[i];}
+function usePhotos(files,folder){photoFiles=Array.from(files);photoFolder=folder||'';if(folder!==undefined)form.elements['photo-files'].value='';refreshSelection();}
+$('#choose-video').onclick=()=>form.elements.video.click();
+form.elements.video.onchange=()=>refreshSelection();
+$('#choose-photos').onclick=()=>form.elements['photo-files'].click();
+form.elements['photo-files'].onchange=()=>usePhotos(form.elements['photo-files'].files);
+$('#choose-folder').onclick=async()=>{if(!window.showDirectoryPicker){form.elements['photo-folder'].click();return;}
+ let dir;try{dir=await window.showDirectoryPicker({mode:'read'});}catch(error){if(error.name!=='AbortError')showSelection('Could not open the folder: '+error.message,'error');return;}
+ showSelection('Reading '+dir.name+'…');try{usePhotos(await handlePhotos(dir),dir.name);}catch(error){showSelection('Could not read the folder: '+error.message,'error');}};
+form.elements['photo-folder'].onchange=()=>{const input=form.elements['photo-folder'],first=input.files[0];usePhotos(directPhotos(input.files),first?first.webkitRelativePath.split('/')[0]:'');};
+const drop=$('#drop');
+drop.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();(currentMode()==='video'?$('#choose-video'):$('#choose-folder')).click();}};
+const hasFiles=e=>e.dataTransfer&&Array.from(e.dataTransfer.types).includes('Files');
+for(const type of ['dragenter','dragover'])document.addEventListener(type,e=>{if(hasFiles(e)){e.preventDefault();drop.classList.add('over');}});
+document.addEventListener('dragleave',e=>{if(!e.relatedTarget)drop.classList.remove('over');});
+document.addEventListener('drop',async e=>{if(!hasFiles(e))return;e.preventDefault();drop.classList.remove('over');if(uploading)return;
+ const entries=Array.from(e.dataTransfer.items).filter(i=>i.kind==='file').map(i=>i.webkitGetAsEntry?i.webkitGetAsEntry():null),files=Array.from(e.dataTransfer.files);
+ try{showSelection('Reading the dropped items…');const dropped=await readDrop(entries,files);setMode(dropped.mode);
+  if(dropped.mode==='video'){const list=new DataTransfer();list.items.add(dropped.files[0]);form.elements.video.files=list.files;refreshSelection();}
+  else usePhotos(dropped.files,dropped.name);}catch(error){showSelection(error.message,'error');}});
+// Super-resolution switch
+const srSwitch=form.elements['super-resolution'];
+srSwitch.onchange=()=>{for(const key of ['sr-tile','sr-prior-weight'])form.elements[key].disabled=!srSwitch.checked;$('#sr-summary').textContent=srSwitch.checked?'On':'Off';};
+// Validation: open the collapsed section that holds the first problem, then explain it.
+function validate(){for(const input of form.querySelectorAll('input,select'))input.classList.remove('invalid');
+ const bad=Array.from(form.querySelectorAll('input:not([type=file]):not([type=radio]),select')).find(i=>!i.disabled&&!i.checkValidity());
+ if(!bad)return true;const section=bad.closest('details');if(section)section.open=true;bad.classList.add('invalid');bad.reportValidity();bad.focus();return false;}
+form.addEventListener('input',e=>{if(e.target.classList.contains('invalid')&&e.target.checkValidity())e.target.classList.remove('invalid');});
+// Progress panel
+const STAGES=['upload','prepare','reconstruct','train','save'];
+const STAGE_TEXT={idle:'Ready',upload:'Uploading',prepare:'Preparing input',reconstruct:'Reconstructing cameras',train:'Training',save:'Saving model',done:'Model saved',failed:'Failed',stopped:'Stopped'};
+let submitted=false,navigated=false,uploading=false,completionHandled=false,lastStage='idle',xhr=null,uploadPercent=0,server={};
+function setMeter(percent,label,value){const meter=$('#meter');meter.classList.toggle('indeterminate',percent===null);
+ meter.firstElementChild.style.width=percent===null?'':percent+'%';if(percent===null)meter.removeAttribute('aria-valuenow');else meter.setAttribute('aria-valuenow',String(Math.round(percent)));
+ $('#meter-label').textContent=label;$('#meter-value').textContent=value||'';}
+function notice(text,isError){const box=$('#notice');box.hidden=!text;box.textContent=text||'';box.classList.toggle('error',!!isError);}
+function render(){
+ const stage=uploading?'upload':(server.stage||'idle');if(STAGES.includes(stage))lastStage=stage;
+ const finished=['done','failed','stopped'].includes(stage),index=STAGES.indexOf(finished?lastStage:stage);
+ for(const [i,item] of Array.from($('#stages').children).entries()){item.className='';
+  if(stage==='done')item.className='done';
+  else if(finished&&i===index&&stage!=='done')item.className='failed';
+  else if(i<index)item.className='done';else if(i===index&&!finished)item.className='active';
+  item.setAttribute('aria-current',i===index&&!finished?'step':'false');}
+ $('#headline').textContent=server.stopping&&!finished?(server.stopping==='save'?'Stopping & saving…':'Discarding…'):STAGE_TEXT[stage]||stage;
+ if(stage==='upload')setMeter(uploadPercent,'Uploading',uploadPercent.toFixed(1)+'%');
+ else if(stage==='train'&&server.progress!=null)setMeter(server.progress,`Step ${server.step} of ${server.steps}`,server.progress.toFixed(1)+'%');
+ else if(stage==='done')setMeter(100,'Finished','100%');
+ else if(stage==='idle'||stage==='failed'||stage==='stopped')setMeter(0,stage==='idle'?'Waiting for an upload':'Not running','');
+ else setMeter(null,STAGE_TEXT[stage]||'Working…','');
+ const busy=uploading||!!server.busy,stopping=!!server.stopping;
+ $('#cancel-upload').hidden=!uploading;
+ $('#stop-save').hidden=uploading||stage!=='train'||stopping;
+ $('#discard').hidden=uploading||!server.busy||stage==='upload'||stopping;
+ build.disabled=busy;$('#submit-hint').textContent=busy?'A job is running. Stop it or wait for it to finish before starting another.':'Keep this page open; the viewer opens when training starts.';
+ link.setAttribute('aria-disabled',server.viewer?'false':'true');link.title=server.viewer?'Open the live viewer in a new tab':'Available once training starts';
+}
+// Requests never wait forever: a stalled one (sleep/wake, network change) is cancelled.
+async function request(url,options,read){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),6000);
+ try{const r=await fetch(url,{...options,signal:controller.signal});return await read(r);}finally{clearTimeout(timer);}}
+let pollGeneration=0,pollTimer=null,pollTick=0;
+function startPolling(){pollGeneration++;clearTimeout(pollTimer);poll(pollGeneration);}
+async function poll(generation){pollTick=performance.now();try{server=await request('/status',{cache:'no-store'},async r=>{if(!r.ok)throw Error();return r.json();});statusBox.textContent=server.status;
+ if(submitted&&!uploading&&!server.busy&&server.saved&&!completionHandled){completionHandled=true;form.elements.output.value='runs/web-'+new Date().toISOString().replace(/[:.]/g,'-');notice('Model saved. Ready for another upload; the viewer stays open.');}
+ if(submitted&&!uploading&&server.viewer&&!navigated){navigated=true;const tab=window.open(viewerURL.href,'flyby-viewer');  // one reused viewer tab, not a new one per job
+if(tab){tab.opener=null;}else{notice('The viewer is ready. Your browser blocked the new tab; use “Open viewer”.');}}
+}catch{statusBox.textContent='Cannot reach the upload server. Check its terminal.';}render();if(generation===pollGeneration)pollTimer=setTimeout(()=>poll(generation),700);}
+// Restart polling when the page comes back (tab shown, focused, resumed, restored or back online),
+// and if it ever stops ticking.
+function wake(){if(!document.hidden)startPolling();}
+for(const type of ['visibilitychange','resume'])document.addEventListener(type,wake);
+for(const type of ['pageshow','focus','online'])window.addEventListener(type,wake);
+setInterval(()=>{if(!document.hidden&&performance.now()-pollTick>5000)startPolling();},2000);
+// Stop controls: Stop & save is reversible in effect (the model is kept); Discard asks once more.
+async function requestStop(action){try{const {r,reply}=await request('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})},
+  async r=>({r,reply:await r.json().catch(()=>({}))}));notice(r.ok?reply.message:(reply.error||'Could not stop the job.'),!r.ok);}catch{notice('Cannot reach the upload server.',true);}}
+$('#stop-save').onclick=()=>requestStop('save');
+let confirmTimer=null;const discard=$('#discard');
+discard.onclick=()=>{if(!discard.classList.contains('confirm')){discard.classList.add('confirm');discard.textContent='Discard job and delete its files?';
+ confirmTimer=setTimeout(()=>{discard.classList.remove('confirm');discard.textContent='Discard';},4000);return;}
+ clearTimeout(confirmTimer);discard.classList.remove('confirm');discard.textContent='Discard';requestStop('discard');};
+$('#cancel-upload').onclick=()=>{if(xhr)xhr.abort();};
+form.onsubmit=e=>{e.preventDefault();if(uploading||server.busy)return;notice('');
+ const photos=currentMode()==='photos';let body,kind,noun;
+ if(photos){if(!photoFiles){showSelection('Drop, choose or select the photos first.','error');drop.focus();return;}
+  try{const picked=pickPhotos(photoFiles);body=photoBatch(picked);noun=picked.length+' photos';}catch(error){showSelection(error.message,'error');return;}kind='application/x-photo-batch';}
+ else{body=form.elements.video.files[0];if(!body){showSelection('Choose or drop a video first.','error');drop.focus();return;}kind='application/octet-stream';noun='video';}
+ if(!validate())return;
+ const params=new URLSearchParams();for(const key of ['steps',photos?'photo-every':'every','max-width','output','brightness','contrast','sharpness','unsharp'])params.set(key,form.elements[key].value);
+ params.set('super-resolution',srSwitch.checked?'true':'false');if(srSwitch.checked){for(const key of ['sr-tile','sr-prior-weight'])params.set(key,form.elements[key].value);}
+ submitted=false;navigated=false;completionHandled=false;uploading=true;uploadPercent=0;render();
+ xhr=new XMLHttpRequest();xhr.open('POST','/upload?'+params);xhr.setRequestHeader('Content-Type',kind);
+ xhr.upload.onprogress=e=>{if(e.lengthComputable){uploadPercent=100*e.loaded/e.total;render();}};
+ xhr.onload=function(){uploading=false;xhr=null;if(this.status===202){submitted=true;notice('Upload complete. Processing '+noun+'…');}else{let text='Upload failed';try{text=JSON.parse(this.responseText).error||text;}catch{}notice(text,true);}render();};
+ xhr.onerror=()=>{uploading=false;xhr=null;notice('Upload connection failed.',true);render();};
+ xhr.onabort=()=>{uploading=false;xhr=null;notice('Upload cancelled.');render();};
+ xhr.send(body);};
+setMode();srSwitch.onchange();startPolling();
 </script></html>

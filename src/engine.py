@@ -24,16 +24,22 @@ try:  # Optional fused CUDA SSIM (see README); training falls back to ssim() bel
     from fused_ssim import fused_ssim
 except ImportError:
     fused_ssim = None
-from src.clip_box import estimate_oriented_box, fit_subject_box
+from src.clip_box import fit_scene_box
 from src.gsplat_viewer import TrainingPreview, start_viewer
 from src.live_viewer import PreviewPublisher, ensure_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
 from src.keyframes import select_keyframes
 from src.image_dataset import ImageDataset, prepare_image_dataset
-from src.run_benchmark import benchmark_run, colmap_command, frame_counts, metrics, stage, timed
+from src.run_benchmark import benchmark_run, colmap_command, frame_counts, metrics, stage, timed, video_duration
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+# Exit code for a run the user stopped without saving (see src/upload_server.py).
+STOPPED_EXIT_CODE = 3
+
+
+class TrainingStopped(Exception):
+    """The user stopped training and chose not to save a model."""
 _PNG_FAST = [cv2.IMWRITE_PNG_COMPRESSION, 1]
 
 
@@ -132,6 +138,7 @@ def extract_frames(video: Path, output: Path, every: int, max_width: int, bright
             future.result()
     reader.release()
     frame_counts(decoded_video_frames=index, frames_before_colmap=len(frames))
+    video_duration(index / fps)
 
     if len(frames) < 2:
         raise RuntimeError("The video did not produce at least two usable frames")
@@ -769,7 +776,7 @@ def train_splats(
     from scipy.spatial import cKDTree
 
     means_np = data["means"].detach().cpu().numpy()
-    bounds_np, axes_np = estimate_oriented_box(means_np)
+    bounds_np, axes_np = fit_scene_box(means_np)
     clip_bounds = torch.from_numpy(bounds_np)
     clip_axes = torch.from_numpy(axes_np)
     tree = cKDTree(means_np)
@@ -888,7 +895,18 @@ def train_splats(
         for _ in range(min(ahead, steps)):
             view_idx = next(batches)
             upcoming.append((view_idx, reader.submit(load_views, view_idx)))
+    # Stop requests come from the viewer or upload page (live_viewer.request_stop).
+    stop_check = getattr(preview, "stop_requested", None)
+    completed = steps
     for step in range(steps):
+        action = stop_check() if stop_check is not None else None
+        if action == "discard":
+            print(f"\nStop requested at step {step}/{steps}: discarding the run.", flush=True)
+            raise TrainingStopped(f"stopped at step {step}/{steps}")
+        if action == "save":
+            completed = step
+            print(f"\nStop requested at step {step}/{steps}: saving the model trained so far.", flush=True)
+            break
         if reader is None:
             idx = next(batches)
         else:
@@ -998,12 +1016,14 @@ def train_splats(
         "opacities": opacities.detach().cpu(),
     }
     print("Fitting final bounding box around the dense subject...", flush=True)
-    final_bounds, final_axes = fit_subject_box(result["means"].numpy())
+    final_bounds, final_axes = fit_scene_box(result["means"].numpy(), torch.sigmoid(result["opacities"]).numpy())
     result.update(clip_bounds=torch.from_numpy(final_bounds),
                   clip_axes=torch.from_numpy(final_axes), clip_final=torch.tensor(True))
+    frame_counts(training_steps_completed=completed)
+    result["steps_completed"] = torch.tensor(completed)
     if preview is not None and not preview.closed:
         preview.publish({**result, "scales": result["scales"].exp(),
-                         "opacities": result["opacities"].sigmoid()}, steps, steps)
+                         "opacities": result["opacities"].sigmoid()}, completed, steps)
     return result
 
 
@@ -1211,11 +1231,24 @@ def build_model(
             metrics(**quality)
             print(f"Held-out views: {quality['eval_views']}, PSNR {quality['eval_psnr']:.2f} dB, "
                   f"SSIM {quality['eval_ssim']:.4f}", flush=True)
+        if targets is not None:
+            # Final-model fit on (every 8th of) the views it was trained on: a few seconds.
+            pick = slice(None, None, 8)
+            fit = evaluate_views(result, data["viewmats"][pick], data["Ks"][pick], targets[pick], width, height, device)
+            metrics(model_views=fit['eval_views'], model_psnr=fit['eval_psnr'], model_ssim=fit['eval_ssim'])
+            print(f"Final model on {fit['eval_views']} training views: PSNR {fit['eval_psnr']:.2f} dB, "
+                  f"SSIM {fit['eval_ssim']:.4f}", flush=True)
         print("Exporting model...", flush=True)
         export_gltf(result, glb_path)
+        completed = int(result.get("steps_completed", steps))
         if preview is not None:
-            preview.finish()
+            preview.finish(message=None if completed >= steps else
+                           f"Model saved - stopped early at step {completed}/{steps}")
         print(f"Model saved: {glb_path}", flush=True)
+    except TrainingStopped:
+        if preview is not None:
+            preview.finish(message="Stopped - nothing was saved")
+        raise
     except Exception as exc:
         if preview is not None:
             preview.finish(exc)
@@ -1371,8 +1404,8 @@ def main() -> None:
         max_axis_ratio=args.max_axis_ratio,
         scale_regularization=args.scale_regularization,
     )
-    print(
-        build_model(
+    try:
+        model = build_model(
             args.video,
             args.output,
             args.every,
@@ -1407,9 +1440,11 @@ def main() -> None:
             eval_every=args.eval_every, ssim_weight=args.ssim_weight,
             scale_means_lr=args.scale_means_lr,
             densify=args.densify, refine_every=args.refine_every, max_gaussians=args.max_gaussians,
-        ),
-        flush=True
-    )
+        )
+    except TrainingStopped as stopped:
+        print(f"Stopped by user ({stopped}); nothing was saved.", flush=True)
+        sys.exit(STOPPED_EXIT_CODE)
+    print(model, flush=True)
 
 
 if __name__ == "__main__":

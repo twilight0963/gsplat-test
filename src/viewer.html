@@ -1,30 +1,249 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gaussian splat viewer</title>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Flyby Render — Viewer</title>
 <style>
-body{margin:0;background:#111;color:#eee;font:16px system-ui;text-align:center}#view{width:100%;height:80vh;object-fit:contain;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-user-drag:none}button{padding:12px;margin:4px;background:#333;color:white;border:1px solid #777;border-radius:6px}p{margin:8px}
+/* Catppuccin Latte (catppuccin.com/palette) */
+:root{--mauve:#8839ef;--red:#d20f39;--green:#40a02b;--blue:#1e66f5;--lavender:#7287fd;--yellow:#df8e1d;
+--text:#4c4f69;--subtext1:#5c5f77;--subtext0:#6c6f85;--overlay1:#8c8fa1;--overlay0:#9ca0b0;--surface2:#acb0be;--surface1:#bcc0cc;--surface0:#ccd0da;--base:#eff1f5;--mantle:#e6e9ef;--crust:#dce0e8;
+--accent:var(--mauve);--accent-hover:#7832d2;--ease:cubic-bezier(.2,.8,.2,1);--glass:rgba(239,241,245,.8)}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;display:grid;grid-template-rows:auto 1fr;background:var(--crust);color:var(--text);font:100%/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
+[hidden]{display:none!important}
+button{font:inherit;color:inherit}
+.topbar{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;padding:.6rem clamp(.75rem,3vw,1.5rem);padding-top:max(.6rem,env(safe-area-inset-top));background:var(--glass);backdrop-filter:blur(18px) saturate(170%);-webkit-backdrop-filter:blur(18px) saturate(170%);box-shadow:0 1px 0 rgba(76,79,105,.1);z-index:3}
+.title{font-weight:650;letter-spacing:-.01em;margin-right:.25rem}
+.pill{display:inline-flex;align-items:center;gap:.5rem;min-height:2rem;padding:0 .8rem;border-radius:1rem;background:#fff;border:1px solid var(--crust);font-size:.85rem;font-variant-numeric:tabular-nums}
+.pill .dot{width:.55rem;height:.55rem;border-radius:50%;background:var(--overlay0)}
+.pill.training .dot{background:var(--accent)}.pill.saved .dot{background:var(--green)}.pill.problem .dot{background:var(--red)}
+.pill .bar{width:4.5rem;height:.35rem;border-radius:.2rem;background:var(--mantle);overflow:hidden}
+.pill .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s var(--ease)}
+.spacer{flex:1}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;min-height:2.25rem;padding:0 .85rem;border-radius:10px;border:1px solid var(--surface0);background:#fff;font-weight:600;font-size:.875rem;cursor:pointer;transition:transform .1s ease-out,background .15s var(--ease)}
+.btn:hover{background:var(--base)}
+.btn:active{transform:scale(.96)}
+.btn:focus-visible,.tool:focus-visible,.segmented input:focus-visible+label{outline:2px solid var(--lavender);outline-offset:2px}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent-hover)}
+.btn.danger{color:var(--red);border-color:#f0b7c3}
+.btn.danger:hover{background:#fdecef}
+.btn.danger.confirm{background:var(--red);border-color:var(--red);color:#fff}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.stage{position:relative;min-height:0;display:grid;place-items:center;padding:.75rem .75rem 5.75rem}
+#view{width:100%;height:100%;object-fit:contain;border-radius:12px;background:#000;box-shadow:0 10px 40px rgba(76,79,105,.25);touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-user-drag:none;cursor:grab}
+#view.dragging{cursor:grabbing}
+.placeholder{position:absolute;inset:0;display:grid;place-items:center;color:var(--subtext0);font-size:.95rem;pointer-events:none}
+/* Floating toolbar */
+.toolbar{position:fixed;left:50%;bottom:max(.9rem,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;justify-content:center;max-width:calc(100vw - 1.5rem);padding:.4rem;border-radius:16px;background:var(--glass);backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);border:1px solid rgba(255,255,255,.6);box-shadow:0 8px 30px rgba(76,79,105,.22);z-index:4}
+.group{display:flex;align-items:center;gap:.15rem}
+.sep{width:1px;height:1.6rem;background:var(--surface0);margin:0 .2rem}
+.tool{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:.1rem;min-width:3.1rem;height:3rem;padding:0 .45rem;border:0;border-radius:10px;background:transparent;cursor:pointer;color:var(--text);transition:background .15s var(--ease),transform .1s ease-out}
+.tool:hover{background:rgba(255,255,255,.75)}
+.tool:active,.tool.pressed{background:#fff;transform:scale(.95)}
+.tool[aria-expanded=true]{background:#fff}
+.tool svg{width:1.25rem;height:1.25rem}
+.tool span{font-size:.68rem;font-weight:600;color:var(--subtext1);letter-spacing:.01em}
+.segmented{display:inline-flex;padding:3px;border-radius:10px;background:rgba(204,208,218,.55)}
+.segmented input{position:absolute;opacity:0;pointer-events:none}
+.segmented label{display:inline-flex;align-items:center;gap:.35rem;height:2.4rem;padding:0 .75rem;border-radius:8px;font-size:.82rem;font-weight:600;color:var(--subtext1);cursor:pointer;transition:background .15s var(--ease),color .15s var(--ease)}
+.segmented label svg{width:1.05rem;height:1.05rem}
+.segmented input:checked+label{background:#fff;color:var(--text);box-shadow:0 1px 3px rgba(76,79,105,.2)}
+@media(max-width:640px){.tool span,.segmented label span{display:none}.tool{min-width:2.6rem;height:2.6rem}}
+/* Popover and help sheet */
+.popover{position:fixed;left:50%;bottom:5.4rem;transform:translateX(-50%);width:min(24rem,calc(100vw - 1.5rem));padding:1rem 1.1rem;border-radius:14px;background:#fff;border:1px solid var(--crust);box-shadow:0 12px 40px rgba(76,79,105,.25);z-index:5;transform-origin:50% 100%;animation:pop .18s var(--ease)}
+@keyframes pop{from{opacity:0;transform:translateX(-50%) scale(.96)}to{opacity:1;transform:translateX(-50%) scale(1)}}
+.popover h2{margin:0 0 .6rem;font-size:.95rem}
+.popover label{display:flex;justify-content:space-between;font-size:.875rem;font-weight:600}
+.popover output{font-variant-numeric:tabular-nums;color:var(--subtext1)}
+.popover input[type=range]{width:100%;margin:.6rem 0 .3rem;accent-color:var(--accent)}
+.popover small{color:var(--subtext0);font-size:.8rem}
+.help{bottom:auto;top:4rem;width:min(30rem,calc(100vw - 1.5rem));transform-origin:50% 0}
+.help dl{display:grid;grid-template-columns:auto 1fr;gap:.35rem 1rem;margin:0;font-size:.85rem}
+.help dt{font-weight:600;white-space:nowrap}
+.help dd{margin:0;color:var(--subtext1)}
+kbd{display:inline-block;min-width:1.4em;padding:0 .35em;border:1px solid var(--surface1);border-bottom-width:2px;border-radius:5px;background:var(--base);font:600 .78rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}
+.toast{position:fixed;left:50%;top:4.2rem;transform:translateX(-50%);max-width:calc(100vw - 1.5rem);padding:.55rem .95rem;border-radius:10px;background:#fff;border:1px solid var(--crust);box-shadow:0 8px 24px rgba(76,79,105,.2);font-size:.875rem;z-index:6}
+.toast.error{color:#a30b2d;border-color:#f0b7c3}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}.btn:active,.tool:active,.tool.pressed{transform:none}}
+@media(prefers-reduced-transparency:reduce){.topbar,.toolbar{background:var(--base);backdrop-filter:none;-webkit-backdrop-filter:none}}
+@media(prefers-contrast:more){.btn,.pill,.toolbar,.popover{border-color:var(--subtext0)}}
 </style>
-<img id="view" alt="Preparing viewer…" draggable="false" style="-moz-user-select: none; -webkit-user-select: none; user-select: none;">
-<div><button id="mode">Mode: orbit</button><button data-action="zoom" data-dx="1">Zoom in</button><button data-action="zoom" data-dx="-1">Zoom out</button><button data-action="reset">Reset</button><button data-action="flip">Flip up</button><button data-action="left">Roll left</button><button data-action="right">Roll right</button><button data-action="straighten">Straighten</button></div>
-<p><label for="clamp">Splat size limit at edges: <output id="clamp-value" for="clamp"></output></label><br><input id="clamp" type="range" min="0" max="10" step="0.1" value="__CLAMP_VALUE__" style="width:min(85%,480px)"><br><small>Adjust the blurriness near the image edges. Lower values may result in empty patches!</small></p>
-<p>Drag to move the model. Pinch to zoom.</p><p id="status" role="status">Connecting…</p>
+<header class="topbar">
+ <span class="title">Flyby Viewer</span>
+ <span class="pill" id="pill" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Connecting…</span><span class="bar" id="pill-bar" hidden><i></i></span></span>
+ <span class="spacer"></span>
+ <button class="btn primary" id="stop-save" hidden title="End training now and save the model trained so far">Stop &amp; save</button>
+ <button class="btn danger" id="discard" hidden title="End training without saving a model">Discard</button>
+ <button class="btn" id="help-button" aria-expanded="false" aria-controls="help" title="Gestures and keyboard shortcuts (H)">Help</button>
+</header>
+<main class="stage" id="stage">
+ <img id="view" alt="Live render of the Gaussian splat model" draggable="false">
+ <div class="placeholder" id="placeholder">Preparing viewer…</div>
+</main>
+<nav class="toolbar" aria-label="Camera controls">
+ <div class="segmented" role="radiogroup" aria-label="Drag moves the camera by">
+  <input type="radio" name="mode" id="mode-orbit" value="orbit" checked><label for="mode-orbit" title="Drag to orbit around the model (O)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><ellipse cx="12" cy="12" rx="9" ry="4"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/><path d="M19 8.5l2-1"/></svg><span>Orbit</span></label>
+  <input type="radio" name="mode" id="mode-pan" value="pan"><label for="mode-pan" title="Drag to slide the view (P)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-2.5 2.5M12 3l2.5 2.5M12 21l-2.5-2.5M12 21l2.5-2.5M3 12l2.5-2.5M3 12l2.5 2.5M21 12l-2.5-2.5M21 12l-2.5 2.5"/></svg><span>Pan</span></label>
+ </div>
+ <span class="sep" aria-hidden="true"></span>
+ <div class="group">
+  <button class="tool" data-action="zoom" data-dx="-1" data-repeat aria-label="Zoom out" title="Zoom out (−)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M20 20l-4-4"/></svg><span>Out</span></button>
+  <button class="tool" data-action="zoom" data-dx="1" data-repeat aria-label="Zoom in" title="Zoom in (+)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M11 8v6M20 20l-4-4"/></svg><span>In</span></button>
+ </div>
+ <span class="sep" aria-hidden="true"></span>
+ <div class="group">
+  <button class="tool" data-action="left" data-repeat aria-label="Roll left" title="Roll left (Z)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4"/></svg><span>Roll</span></button>
+  <button class="tool" data-action="right" data-repeat aria-label="Roll right" title="Roll right (C)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v4h-4"/></svg><span>Roll</span></button>
+  <button class="tool" data-action="straighten" aria-label="Level the horizon" title="Level the horizon (X)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3 12h18"/><circle cx="12" cy="12" r="2.5"/><path d="M6 8v8M18 8v8"/></svg><span>Level</span></button>
+  <button class="tool" data-action="flip" aria-label="Flip upside down" title="Flip which way is up (U)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4v16M8 4L5 7M8 4l3 3M16 20V4M16 20l-3-3M16 20l3-3"/></svg><span>Flip</span></button>
+ </div>
+ <span class="sep" aria-hidden="true"></span>
+ <div class="group">
+  <button class="tool" data-action="reset" aria-label="Reset view" title="Reset the camera (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span>Reset</span></button>
+  <button class="tool" id="display-button" aria-expanded="false" aria-controls="display" aria-label="Display settings" title="Display settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg><span>Display</span></button>
+ </div>
+</nav>
+<section class="popover" id="display" hidden aria-labelledby="display-title">
+ <h2 id="display-title">Display</h2>
+ <label for="clamp">Edge splat size limit <output id="clamp-value" for="clamp"></output></label>
+ <input id="clamp" type="range" min="0" max="10" step="0.1" value="__CLAMP_VALUE__">
+ <small>Limits blurry, oversized splats near the edges of the model. Lower is sharper but can leave gaps; 0 turns the limit off.</small>
+</section>
+<section class="popover help" id="help" hidden aria-labelledby="help-title">
+ <h2 id="help-title">Moving around</h2>
+ <dl>
+  <dt>Drag</dt><dd>Orbit or pan, as chosen in the toolbar</dd>
+  <dt>Right-drag, <kbd>Shift</kbd>-drag</dt><dd>Pan, in either mode</dd>
+  <dt>Scroll, pinch</dt><dd>Zoom</dd>
+  <dt>Two-finger drag</dt><dd>Pan (touch)</dd>
+  <dt><kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Orbit or pan, as chosen; with <kbd>Shift</kbd>, pan</dd>
+  <dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>Zoom in / out</dd>
+  <dt><kbd>O</kbd> <kbd>P</kbd></dt><dd>Orbit / pan mode</dd>
+  <dt><kbd>Z</kbd> <kbd>C</kbd> <kbd>X</kbd></dt><dd>Roll left / right, level the horizon</dd>
+  <dt><kbd>U</kbd> <kbd>R</kbd></dt><dd>Flip up, reset the camera</dd>
+  <dt><kbd>H</kbd> <kbd>Esc</kbd></dt><dd>Show / close this help</dd>
+ </dl>
+</section>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 <script>
-const view=document.querySelector('#view'),status=document.querySelector('#status');
-let mode='orbit',objectURL;
-async function refresh(){try{const r=await fetch('/frame.jpg',{cache:'no-store'});if(!r.ok)throw Error();const next=URL.createObjectURL(await r.blob());view.src=next;if(objectURL)URL.revokeObjectURL(objectURL);objectURL=next;status.textContent='Connected';}catch{status.textContent='Waiting for viewer…';}setTimeout(refresh,100);}refresh();
-let pending=[];let sending=false;
-async function send(action,dx=0,dy=0){if(pending.length<64)pending.push({action,dx,dy});if(sending)return;sending=true;try{while(pending.length){const r=await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pending.shift())});if(!r.ok)status.textContent='Control unavailable';}}catch{pending=[];status.textContent='Connection interrupted';}finally{sending=false;}}
-document.querySelector('#mode').onclick=e=>{mode=mode==='orbit'?'pan':'orbit';e.target.textContent='Mode: '+mode;};
-document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>send(b.dataset.action,Number(b.dataset.dx||0)));
-const clampInput=document.querySelector('#clamp'),clampValue=document.querySelector('#clamp-value');
+const view=document.querySelector('#view'),placeholder=document.querySelector('#placeholder');
+const $=selector=>document.querySelector(selector);
+// ---- Requests never wait forever: a stalled one (sleep/wake, network change) is
+// cancelled, so no loop can stop for good. The timeout covers reading the reply too.
+async function request(url,options,read){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),6000);
+ try{const r=await fetch(url,{...options,signal:controller.signal});return await read(r);}finally{clearTimeout(timer);}}
+// A loop that restarts itself: each run has a generation, so a restarted loop
+// never runs twice alongside an older one that wakes up late.
+function loop(step){const state={generation:0,timer:null,tick:0};
+ async function run(generation){state.tick=performance.now();let delay=1000;try{delay=await step();}catch{}
+  if(generation===state.generation)state.timer=setTimeout(()=>run(generation),delay);}
+ state.start=()=>{state.generation++;clearTimeout(state.timer);run(state.generation);};return state;}
+// ---- Frames: one request in flight; faster while the camera is moving. ----
+let objectURL=null,lastRevision=null,lastInteraction=-Infinity,lastFrame=0;  // no fast polling until the user interacts
+const frames=loop(async()=>{
+ // A hidden tab fetches nothing: frames are only useful on screen, and a background
+ // tab kept busy during training is what browsers struggle with. Showing it resumes at once.
+ if(document.hidden)return 1000;
+ try{const frame=await request('/frame.jpg',{cache:'no-store'},async r=>{if(!r.ok)throw Error();const revision=r.headers.get('X-Frame-Revision');
+   return {revision,blob:revision===null||revision!==lastRevision?await r.blob():null};});
+  if(frame.blob){const next=URL.createObjectURL(frame.blob);view.src=next;if(objectURL)URL.revokeObjectURL(objectURL);objectURL=next;lastRevision=frame.revision;}
+  lastFrame=performance.now();placeholder.hidden=true;return performance.now()-lastInteraction<1500?30:120;
+ }catch{placeholder.hidden=false;placeholder.textContent=lastFrame?'Reconnecting to the viewer…':'Waiting for the viewer…';return 500;}});
+// ---- Controls: movements are summed and sent once per animation frame. ----
+const queue=[];let sending=false,movement=null,frameRequested=false;
+function send(action,dx=0,dy=0){lastInteraction=performance.now();
+ if(action==='orbit'||action==='pan'||action==='zoom'){
+  if(!movement||movement.action!==action){flushMovement();movement={action,dx:0,dy:0};}
+  movement.dx+=dx;movement.dy+=dy;if(!frameRequested){frameRequested=true;requestAnimationFrame(()=>{frameRequested=false;flushMovement();});}return;}
+ flushMovement();enqueue({action,dx,dy});}
+function flushMovement(){if(!movement)return;const m=movement;movement=null;
+ const limit=m.action==='zoom'?10:1000;m.dx=Math.max(-limit,Math.min(limit,m.dx));m.dy=Math.max(-limit,Math.min(limit,m.dy));
+ if(m.dx||m.dy)enqueue(m);}
+async function enqueue(command){if(queue.length<64)queue.push(command);if(sending)return;sending=true;
+ try{while(queue.length){const ok=await request('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(queue.shift())},async r=>r.ok);if(!ok)toast('That control is unavailable right now.',true);}}
+ catch{queue.length=0;toast('Connection to the viewer was interrupted; try again.',true);}finally{sending=false;}}
+const modeOf=()=>document.querySelector('input[name=mode]:checked').value;
+function setMode(mode){document.querySelector(`input[name=mode][value=${mode}]`).checked=true;}
+// Buttons respond on press; zoom and roll repeat while held.
+for(const button of document.querySelectorAll('[data-action]')){
+ const fire=()=>send(button.dataset.action,Number(button.dataset.dx||0));let timer=null;
+ const stop=()=>{clearTimeout(timer);clearInterval(timer);timer=null;button.classList.remove('pressed');};
+ button.addEventListener('pointerdown',e=>{if(e.button!==0)return;button.classList.add('pressed');fire();
+  if(button.hasAttribute('data-repeat'))timer=setTimeout(()=>{timer=setInterval(fire,70);},350);});
+ for(const type of ['pointerup','pointerleave','pointercancel'])button.addEventListener(type,stop);
+ // Keyboard and assistive-technology activation arrive as a click with no pointer (detail 0).
+ button.addEventListener('click',e=>{if(e.detail===0)fire();});}
+// ---- Pointer gestures on the render ----
+const pointers=new Map();let panDrag=false;
+const points=()=>[...pointers.values()];
+const spread=()=>{const p=points();return Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);};
+const middle=()=>{const p=points();return {x:(p[0].x+p[1].x)/2,y:(p[0].y+p[1].y)/2};};
+for(const type of ['dragstart','selectstart','contextmenu'])view.addEventListener(type,e=>e.preventDefault());
+view.addEventListener('pointerdown',e=>{e.preventDefault();view.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+ panDrag=e.button===1||e.button===2||e.shiftKey;view.classList.add('dragging');});
+view.addEventListener('pointermove',e=>{const old=pointers.get(e.pointerId);if(!old)return;
+ if(pointers.size===2){const beforeSpread=spread(),beforeMiddle=middle();pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  const afterSpread=spread(),afterMiddle=middle();
+  if(beforeSpread>0&&afterSpread>0)send('zoom',Math.log(beforeSpread/afterSpread)/Math.log(.9));
+  send('pan',afterMiddle.x-beforeMiddle.x,afterMiddle.y-beforeMiddle.y);return;}
+ pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+ send(panDrag||e.shiftKey?'pan':modeOf(),e.clientX-old.x,e.clientY-old.y);});
+const release=e=>{pointers.delete(e.pointerId);if(!pointers.size){view.classList.remove('dragging');panDrag=false;}};
+for(const type of ['pointerup','pointercancel','lostpointercapture'])view.addEventListener(type,release);
+view.addEventListener('wheel',e=>{e.preventDefault();const lines=e.deltaMode===1?e.deltaY*16:e.deltaY;send('zoom',Math.max(-4,Math.min(4,-lines/60)));},{passive:false});
+// ---- Keyboard ----
+document.addEventListener('keydown',e=>{if((e.target instanceof Element&&e.target.closest('input,textarea,select'))||e.metaKey||e.ctrlKey||e.altKey)return;
+ const step=24,key=e.key,move=e.shiftKey?'pan':modeOf();
+ const keys={'+':()=>send('zoom',1),'=':()=>send('zoom',1),'-':()=>send('zoom',-1),'_':()=>send('zoom',-1),
+  r:()=>send('reset'),u:()=>send('flip'),z:()=>send('left'),c:()=>send('right'),x:()=>send('straighten'),
+  o:()=>setMode('orbit'),p:()=>setMode('pan'),h:()=>toggle('help'),
+  ArrowLeft:()=>send(move,-step,0),ArrowRight:()=>send(move,step,0),
+  ArrowUp:()=>send(move,0,-step),ArrowDown:()=>send(move,0,step),
+  Escape:()=>{close('help');close('display');}};
+ const action=keys[key]||keys[key.toLowerCase()];if(action){e.preventDefault();action();}});
+// ---- Popovers: anchored to their buttons, closed by Esc or a click outside ----
+const toggles={help:$('#help-button'),display:$('#display-button')};
+function toggle(id){$('#'+id).hidden?open(id):close(id);}
+function open(id){for(const other of Object.keys(toggles))if(other!==id)close(other);$('#'+id).hidden=false;toggles[id].setAttribute('aria-expanded','true');}
+function close(id){$('#'+id).hidden=true;toggles[id].setAttribute('aria-expanded','false');}
+for(const [id,button] of Object.entries(toggles))button.addEventListener('click',()=>toggle(id));
+document.addEventListener('pointerdown',e=>{for(const [id,button] of Object.entries(toggles))if(!$('#'+id).hidden&&!$('#'+id).contains(e.target)&&!button.contains(e.target))close(id);});
+// ---- Edge size limit ----
+const clampInput=$('#clamp'),clampValue=$('#clamp-value');
 const initialClamp=Number(clampInput.getAttribute('value'));
 clampInput.max=Math.max(10,Math.ceil(initialClamp));clampInput.value=initialClamp;
-function showClamp(){clampValue.textContent=Number(clampInput.value).toFixed(1)+(Number(clampInput.value)===0?' (off)':'');}showClamp();
-clampInput.oninput=()=>{showClamp();pending=pending.filter(command=>command.action!=='size_clamp');send('size_clamp',Number(clampInput.value));};
-const pointers=new Map();const distance=()=>{const p=[...pointers.values()];return Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);};
-for(const event of ['dragstart','selectstart','contextmenu'])view.addEventListener(event,e=>e.preventDefault());
-view.onpointerdown=e=>{e.preventDefault();view.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});};
-view.onpointermove=e=>{const old=pointers.get(e.pointerId);if(!old)return;const before=pointers.size===2?distance():0;pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.size===2){const after=distance();if(before>0&&after>0)send('zoom',Math.max(-10,Math.min(10,Math.log(before/after)/Math.log(.9))));}else{send(mode,Math.max(-1000,Math.min(1000,e.clientX-old.x)),Math.max(-1000,Math.min(1000,e.clientY-old.y)));}};
-view.onpointerup=view.onpointercancel=view.onlostpointercapture=e=>pointers.delete(e.pointerId);
-view.addEventListener('wheel',e=>{e.preventDefault();send('zoom',e.deltaY<0?1:-1);},{passive:false});
+function showClamp(){const value=Number(clampInput.value);clampValue.textContent=value===0?'Off':value.toFixed(1)+'×';}showClamp();
+clampInput.oninput=()=>{showClamp();for(let i=queue.length-1;i>=0;i--)if(queue[i].action==='size_clamp')queue.splice(i,1);send('size_clamp',Number(clampInput.value));};
+// ---- Training status and stop controls ----
+let toastTimer=null;
+function toast(text,isError){const box=$('#toast');box.textContent=text;box.classList.toggle('error',!!isError);box.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>{box.hidden=true;},4000);}
+let stopping=null;
+const statusLoop=loop(async()=>{let delay=1000;if(document.hidden)return 2000;
+ try{const s=await request('/status',{cache:'no-store'},async r=>{if(r.status===404)return null;if(!r.ok)throw Error();return r.json();});
+  if(s===null){$('#pill').className='pill';$('#pill-text').textContent='Connected';$('#stop-save').hidden=$('#discard').hidden=true;return 5000;} // viewer too old to report status
+  const pill=$('#pill'),bar=$('#pill-bar'),percent=s.total?100*s.completed/s.total:null;
+  pill.className='pill'+(s.training?' training':/saved/i.test(s.status)?' saved':/fail|stopped/i.test(s.status)?' problem':'');
+  $('#pill-text').textContent=s.training?(stopping?(stopping==='save'?'Stopping & saving…':'Discarding…'):(percent===null?'Preparing training…':`Training ${percent.toFixed(1)}% · step ${s.completed} of ${s.total}`)):s.status;
+  bar.hidden=!s.training||percent===null;if(percent!==null)bar.firstElementChild.style.width=percent+'%';
+  if(!s.training)stopping=null;
+  $('#stop-save').hidden=!s.training||!!stopping;$('#discard').hidden=!s.training||!!stopping;
+ }catch{$('#pill').className='pill problem';$('#pill-text').textContent='Reconnecting…';$('#stop-save').hidden=$('#discard').hidden=true;delay=2000;}
+ return delay;});
+// Restart the loops whenever the page comes back: tab shown again, window focused,
+// resumed after the browser froze it, restored from the back/forward cache, or back online.
+function wake(){if(document.hidden)return;frames.start();statusLoop.start();}
+for(const type of ['visibilitychange','resume'])document.addEventListener(type,wake);
+for(const type of ['pageshow','focus','online'])window.addEventListener(type,wake);
+// Watchdog: a loop that has not ticked for a while is restarted.
+setInterval(()=>{if(document.hidden)return;const now=performance.now();
+ if(now-frames.tick>4000)frames.start();if(now-statusLoop.tick>8000)statusLoop.start();},2000);
+frames.start();statusLoop.start();
+async function requestStop(action){try{const {r,reply}=await request('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})},
+  async r=>({r,reply:await r.json().catch(()=>({}))}));if(r.ok){stopping=action;$('#stop-save').hidden=$('#discard').hidden=true;}toast(r.ok?reply.message:(reply.error||'Could not stop training.'),!r.ok);}
+ catch{toast('Cannot reach the viewer.',true);}}
+$('#stop-save').onclick=()=>requestStop('save');
+let confirmTimer=null;const discard=$('#discard');
+discard.onclick=()=>{if(!discard.classList.contains('confirm')){discard.classList.add('confirm');discard.textContent='Discard without saving?';
+ confirmTimer=setTimeout(()=>{discard.classList.remove('confirm');discard.textContent='Discard';},4000);return;}
+ clearTimeout(confirmTimer);discard.classList.remove('confirm');discard.textContent='Discard';requestStop('discard');};
 </script></html>

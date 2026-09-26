@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import numpy as np
-from src.clip_box import estimate_box, box_mask, validate_box, half_volume_box, estimate_oriented_box, validate_axes, box_view
+from src.clip_box import estimate_box, box_mask, validate_box, estimate_oriented_box, validate_axes, box_view
 from src.gltf_gsplat import write_gsplat_glb, read_gsplat_glb
 
 class ClipTests(unittest.TestCase):
@@ -32,15 +32,6 @@ class ClipTests(unittest.TestCase):
             result=read_gsplat_glb(p)
             np.testing.assert_array_equal(result['clip_axes'],axes)
             np.testing.assert_array_equal(result['clip_bounds'],bounds)
-
-    def test_half_volume_preserves_center_and_original_bounds(self):
-        bounds = np.array([[2, 4, 6], [10, 12, 14]], dtype=np.float32)
-        original = bounds.copy()
-        smaller = half_volume_box(bounds)
-        np.testing.assert_allclose(smaller.mean(axis=0), bounds.mean(axis=0))
-        self.assertAlmostEqual(float(np.prod(smaller[1] - smaller[0]) /
-                                     np.prod(bounds[1] - bounds[0])), 0.5, places=6)
-        np.testing.assert_array_equal(bounds, original)
 
     def test_cube_rejects_outlier_influence(self):
         points = np.random.default_rng(4).uniform(-1, 1, (1000, 3))

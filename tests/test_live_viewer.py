@@ -56,3 +56,29 @@ class LiveViewerTests(unittest.TestCase):
             ensure.assert_called_once()
             publisher.return_value.finish.assert_called_once_with()
             publisher.return_value.close.assert_called_once()
+
+
+class SharedViewerDirectoryTests(unittest.TestCase):
+    def test_two_publishers_in_one_directory_do_not_collide(self):
+        import tempfile
+        from pathlib import Path
+        from threading import Thread
+        import torch
+        from src.live_viewer import PreviewPublisher
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = []
+
+            def publish(publisher):
+                try:
+                    for i in range(40):
+                        publisher.publish({'means': torch.rand(2000, 3)}, i, 40)
+                except Exception as exc:  # recorded for the assertion below
+                    errors.append(exc)
+
+            threads = [Thread(target=publish, args=(PreviewPublisher(tmp),)) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ['snapshot.npz', 'state.json'])

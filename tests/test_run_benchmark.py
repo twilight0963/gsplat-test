@@ -38,7 +38,8 @@ class BenchmarkTests(unittest.TestCase):
             with patch.object(engine.cv2, 'VideoCapture') as capture, \
                  patch.object(engine, 'apply_cas', side_effect=lambda images, *_: images) as cas, \
                  patch.object(engine, 'run_colmap', side_effect=check_colmap), \
-                 patch.object(engine, 'load_reconstruction', return_value=({}, [root/'a.png'], 10, 8)), \
+                 patch.object(engine, 'load_reconstruction', return_value=({'viewmats': torch.eye(4)[None], 'Ks': torch.eye(3)[None]}, [root/'a.png'], 10, 8)), \
+                 patch.object(engine, 'evaluate_views', return_value={'eval_views': 1, 'eval_psnr': 31.25, 'eval_ssim': .95}) as fit, \
                  patch.object(engine, 'train_splats', return_value={}), \
                  patch.object(engine, 'export_gltf'), \
                  patch.object(engine, 'PreviewPublisher'), patch.object(engine, 'ensure_viewer'):
@@ -57,7 +58,14 @@ class BenchmarkTests(unittest.TestCase):
                              'frames_before_colmap': 3, 'frames_after_colmap': 1, 'keyframe_candidates': 3})
             self.assertEqual(report['status'], 'completed')
             self.assertEqual(report['absolute_accuracy']['status'], 'unverified')
-            self.assertTrue(report['runtime_target_met'])
+            # 5 frames at 30 fps: the target is 1.5x the 1/6 s video.
+            self.assertAlmostEqual(report['video_seconds'], 5 / 30)
+            self.assertAlmostEqual(report['runtime_target_seconds'], .25)
+            self.assertEqual(report['runtime_target_met'], report['total_seconds'] <= .25)
+            self.assertIn('Runtime target (0 s = 1.5x the 0 s video)', (root/'out/benchmark.log').read_text())
+            # Final model quality is measured on the views it was trained on.
+            self.assertEqual(report['quality'], {'model_views': 1, 'model_psnr': 31.25, 'model_ssim': .95})
+            self.assertEqual(fit.call_args.args[3][0, 0, 0, 0].item(), 210)
             self.assertEqual(report['settings']['sequential_overlap'], 12)
             self.assertGreaterEqual(report['total_seconds'], sum(report['stage_seconds'].values()))
             self.assertEqual(report['settings']['view_batch_size'], 4)
@@ -82,9 +90,12 @@ class BenchmarkTests(unittest.TestCase):
             trained = train.call_args
             self.assertEqual(trained.args[1], images[1:4])
             self.assertEqual(trained.kwargs['targets'][:, 0, 0, 0].tolist(), [1, 2, 3])
-            self.assertEqual(evaluate.call_args.args[3][:, 0, 0, 0].tolist(), [0, 4])
+            held_out, final_fit = evaluate.call_args_list
+            self.assertEqual(held_out.args[3][:, 0, 0, 0].tolist(), [0, 4])
+            self.assertEqual(final_fit.args[3][:, 0, 0, 0].tolist(), [1])  # every 8th training view
             report = json.loads((root / 'out/benchmark.json').read_text())
-            self.assertEqual(report['quality'], {'eval_views': 2, 'eval_psnr': 30.5, 'eval_ssim': .9})
+            self.assertEqual(report['quality'], {'eval_views': 2, 'eval_psnr': 30.5, 'eval_ssim': .9,
+                                                 'model_views': 2, 'model_psnr': 30.5, 'model_ssim': .9})
             self.assertEqual(report['settings']['eval_every'], 4)
             self.assertIn('Quality eval_psnr: 30.5000', (root / 'out/benchmark.log').read_text())
 

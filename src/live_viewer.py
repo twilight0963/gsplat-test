@@ -6,19 +6,15 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 import uuid
 
 import numpy as np
 import torch
 
+from src.training_control import STOP_ACTIONS, atomic_json, read_state, request_stop, training_active  # noqa: F401
+
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def atomic_json(path, value):
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value))
-    os.replace(temporary, path)
 
 
 class PreviewPublisher:
@@ -28,28 +24,51 @@ class PreviewPublisher:
         self.session = uuid.uuid4().hex
         self.closed = False
         self.revision = 0
-        self.state = {'session': self.session, 'revision': 0, 'snapshot': None,
+        self.stop_checked = None
+        self.state = {'session': self.session, 'revision': 0, 'snapshot': None, 'active': True, 'pid': os.getpid(),
+                      'completed': 0, 'total': None,
                       'status': 'Training: 0.0% - preparing images and splats'}
         self._write()
 
+    def stop_requested(self):
+        """'save' or 'discard' once, if a stop was requested for this session; else None."""
+        path = self.directory / 'stop.json'
+        try:
+            stamp = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
+        if stamp == self.stop_checked:
+            return None
+        self.stop_checked = stamp
+        try:
+            request = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if request.get('session') != self.session or request.get('action') not in STOP_ACTIONS:
+            return None
+        return request['action']
+
     def _write(self):
-        atomic_json(self.directory / 'state.json', self.state)
+        atomic_json(self.directory / 'state.json', self.state, self.session)
 
     def publish(self, data, completed, total):
         if self.closed:
             return
         path = self.directory / 'snapshot.npz'
-        with (self.directory / 'snapshot.tmp').open('wb') as output:
+        temporary = self.directory / f'snapshot.{self.session}.tmp'
+        with temporary.open('wb') as output:
             np.savez(output, **{key: tensor.detach().cpu().numpy() for key, tensor in data.items()},
                      _session=np.array(self.session), _revision=np.array(self.revision + 1))
-        os.replace(self.directory / 'snapshot.tmp', path)
+        os.replace(temporary, path)
         self.revision += 1
-        self.state.update(revision=self.revision, snapshot=path.name,
+        self.state.update(revision=self.revision, snapshot=path.name, completed=completed, total=total,
                           status=f'Training: {100 * completed / total:.1f}% ({completed}/{total})')
         self._write()
 
-    def finish(self, error=None):
-        self.state['status'] = f'Training failed: {error}' if error else 'Training: 100.0% - model saved'
+    def finish(self, error=None, message=None):
+        if message is None:
+            message = f'Training failed: {error}' if error else 'Training: 100.0% - model saved'
+        self.state.update(status=message, active=False)
         self._write()
 
     def close(self):
@@ -84,17 +103,43 @@ class FilePreview:
         self.closed = True
 
 
+def _viewer_health():
+    try:
+        with urlopen('http://127.0.0.1:8000/health', timeout=1) as response:
+            return json.load(response)
+    except (OSError, ValueError):
+        return None
+
+
 def ensure_viewer(directory, width, height):
+    from src.viewer_http import code_version
     directory = Path(directory).resolve()
+    version = code_version()
+
     def healthy():
-        try:
-            with urlopen('http://127.0.0.1:8000/health', timeout=1) as response:
-                return json.load(response).get('preview_directory') == str(directory)
-        except (OSError, ValueError):
-            return False
+        health = _viewer_health()
+        return bool(health) and health.get('preview_directory') == str(directory) and health.get('version') == version
+
     if healthy():
         print('Viewer ready: http://localhost:8000/', flush=True)
         return
+    health = _viewer_health()
+    if health and health.get('preview_directory') == str(directory):
+        # A viewer from older code is still running: ask it to exit so this one serves the current page.
+        try:
+            with urlopen(Request('http://127.0.0.1:8000/shutdown', data=b'', method='POST'), timeout=2):
+                pass
+        except OSError:
+            pass
+        for _ in range(100):
+            if _viewer_health() is None:
+                break
+            time.sleep(.1)
+        else:
+            print('Warning: an older viewer is running on port 8000 and could not be replaced; '
+                  'restart it (stop the src.live_viewer process) to get the current viewer page.', flush=True)
+            print('Viewer ready: http://localhost:8000/', flush=True)
+            return
     log_path = directory / 'viewer.log'
     with log_path.open('ab') as log:
         process = subprocess.Popen(

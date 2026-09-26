@@ -12,7 +12,8 @@ from queue import Empty
 import math
 from time import sleep
 from src.viewer_http import ViewerHTTP
-from src.clip_box import estimate_oriented_box, validate_box, validate_axes, box_view, half_volume_box, box_mask, draw_box, fit_subject_box
+from itertools import product
+from src.clip_box import fit_scene_box, validate_box, validate_axes, box_view, box_mask, draw_box
 
 
 class TrainingPreview:
@@ -50,6 +51,11 @@ class TrainingPreview:
 from src.gltf_gsplat import read_gsplat_glb
 
 
+# Default viewing angle above the scene's ground plane: an oblique drone-style view
+# (about 32 degrees) shows more of a wide, flat site than a near-horizontal one.
+DEFAULT_ELEVATION = 0.55
+
+
 class OrbitCamera:
     def __init__(self, target: np.ndarray, radius: float, box_axes: np.ndarray | None = None):
         self.target = target.copy()
@@ -57,7 +63,7 @@ class OrbitCamera:
         self.radius = radius
         self.default_radius = radius
         self.azimuth = 0.0
-        self.elevation = 0.3
+        self.elevation = DEFAULT_ELEVATION
         self.roll = 0.0
         self.up_sign = -1.0
         self.orbit_frame = np.eye(3)
@@ -79,7 +85,7 @@ class OrbitCamera:
         self.target = self.default_target.copy()
         self.radius = self.default_radius
         self.azimuth = 0.0
-        self.elevation = 0.3
+        self.elevation = DEFAULT_ELEVATION
         self.roll = 0.0
         self.up_sign = -1.0
 
@@ -132,6 +138,37 @@ class OrbitCamera:
         """Shared bracket-key zoom steps: positive in, negative out."""
         base = 0.9 if steps >= 0 else 1.1
         self.radius = float(np.clip(self.radius * base ** (abs(steps) * 0.25), 1e-3, 1e8))
+
+
+def framing_radius(cam: OrbitCamera, bounds: np.ndarray, axes: np.ndarray, K: np.ndarray,
+                   width: int, height: int, fill: float = 0.9) -> float:
+    """Closest orbit distance at which all eight box corners are on screen.
+
+    Uses the camera's own direction, so wide, flat scenes are framed by what is
+    actually visible rather than by the box diagonal (which left them small).
+    """
+    corners = np.array(list(product(*zip(bounds[0], bounds[1]))), dtype=np.float64) @ np.asarray(axes, np.float64).T
+    margin_x, margin_y = width * (1 - fill) / 2, height * (1 - fill) / 2
+
+    def fits(radius: float) -> bool:
+        cam.radius = radius
+        view = cam.viewmat().astype(np.float64)
+        camera = corners @ view[:3, :3].T + view[:3, 3]
+        if (camera[:, 2] <= 1e-9).any():
+            return False
+        projected = camera @ K.astype(np.float64).T
+        x, y = projected[:, 0] / projected[:, 2], projected[:, 1] / projected[:, 2]
+        return bool((x >= margin_x).all() and (x <= width - margin_x).all()
+                    and (y >= margin_y).all() and (y <= height - margin_y).all())
+
+    diagonal = max(float(np.linalg.norm(bounds[1] - bounds[0])), 1e-6)
+    low, high = 0.0, diagonal
+    while not fits(high) and high < diagonal * 1e4:
+        high *= 2
+    for _ in range(40):
+        middle = (low + high) / 2
+        low, high = (low, middle) if fits(middle) else (middle, high)
+    return high
 
 
 def make_K(width: int, height: int, fov_deg: float) -> np.ndarray:
@@ -313,18 +350,13 @@ def start_viewer(
                     cached_view = None
                     state["dragging"] = None
                 if clip_bounds is None:
-                    if final_box and not bool(data.get("clip_final", False)):
-                        clip_bounds, clip_axes = fit_subject_box(data["means"].numpy())
-                    elif "clip_axes" in data and "clip_bounds" in data:
+                    if preview is None or not ("clip_axes" in data and "clip_bounds" in data):
+                        # Saved models are refitted, so files made with the older, tighter
+                        # subject box also open with the whole scene.
+                        clip_bounds, clip_axes = fit_scene_box(data["means"].numpy(), data["opacities"].numpy())
+                    else:
                         clip_bounds = validate_box(data["clip_bounds"])
                         clip_axes = validate_axes(data["clip_axes"])
-                    else:
-                        # Legacy models have no orientation; infer it from their cloud.
-                        clip_bounds, clip_axes = estimate_oriented_box(data["means"].numpy())
-                    # Apply once in the viewer, so existing files and live previews
-                    # use the same crop without shrinking saved bounds repeatedly.
-                    if not final_box:
-                        clip_bounds = half_volume_box(clip_bounds)
                     final_box_applied = final_box
                 bounds_t = torch.from_numpy(clip_bounds)
                 local_means = data["means"] @ torch.from_numpy(clip_axes)
@@ -343,8 +375,9 @@ def start_viewer(
                 if cam is None and len(data["means"]):
                     means_np = data["means"].numpy()
                     target = clip_bounds.mean(axis=0) @ clip_axes.T
-                    radius = float(np.linalg.norm(clip_bounds[1] - clip_bounds[0])) * 0.9
-                    cam = OrbitCamera(target, radius, box_axes=clip_axes)
+                    cam = OrbitCamera(target, 1.0, box_axes=clip_axes)
+                    cam.radius = cam.default_radius = framing_radius(
+                        cam, clip_bounds, clip_axes, make_K(width, height, fov), width, height)
                 data = None
 
             if web is not None:
@@ -409,7 +442,9 @@ def start_viewer(
             cached_size = size
             if redraw or status != cached_status or state["show_help"] != cached_help:
                 display = _draw_help(frame_bgr) if state["show_help"] else frame_bgr.copy()
-                if status:
+                # The browser page shows status itself (viewer_http /status); only the
+                # desktop window needs it drawn into the frame.
+                if status and desktop:
                     cv2.rectangle(display, (0, height - 36), (width, height), (0, 0, 0), -1)
                     cv2.putText(display, status, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, (255, 255, 255), 1, cv2.LINE_AA)
@@ -426,6 +461,8 @@ def start_viewer(
                 cached_status, cached_help = status, state["show_help"]
 
             if web is not None:
+                if web.shutdown_requested:
+                    break  # a newer viewer is replacing this one (live_viewer.ensure_viewer)
                 sleep(0.016)
                 continue
             key = cv2.waitKey(16) & 0xFF

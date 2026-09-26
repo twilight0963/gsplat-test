@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
+import torch
 
 from src import engine
 from src.image_dataset import ImageDataset, prepare_image_dataset, read_photo
@@ -118,7 +119,8 @@ class ImageDatasetTests(unittest.TestCase):
             with patch.object(engine, 'prepare_image_dataset', return_value=dataset), \
                  patch.object(engine, 'extract_frames') as video, \
                  patch.object(engine, 'run_colmap'), \
-                 patch.object(engine, 'load_reconstruction', return_value=({}, [frame], 10, 8)), \
+                 patch.object(engine, 'load_reconstruction', return_value=({'viewmats': torch.eye(4)[None], 'Ks': torch.eye(3)[None]}, [frame], 10, 8)), \
+                 patch.object(engine, 'evaluate_views', return_value={'eval_views': 1, 'eval_psnr': 31.25, 'eval_ssim': .95}), \
                  patch.object(engine, 'apply_cas', side_effect=lambda images, *_: images), \
                  patch.object(engine, 'PreviewPublisher'), patch.object(engine, 'ensure_viewer'), \
                  patch.object(engine, 'train_splats', return_value={}) as train, \
@@ -129,6 +131,7 @@ class ImageDatasetTests(unittest.TestCase):
             self.assertEqual(report['frame_counts']['frames_before_colmap'], 2)
             self.assertEqual(report['frame_counts']['frames_after_colmap'], 1)
             self.assertIsNone(report['frame_counts']['decoded_video_frames'])
+            self.assertEqual(report['runtime_target_seconds'], 600)  # photo sets have no video length
             target = train.call_args.kwargs['targets']
             self.assertEqual(target[0, 0, 0].tolist(), [110, 110, 110])
 

@@ -61,6 +61,19 @@ def frame_counts(**counts):
         run['counts'].update(counts)
 
 
+def video_duration(seconds):
+    """Record the input video's length; the runtime target is 1.5x it."""
+    run = _active.get()
+    if run is not None:
+        run['video_seconds'] = seconds
+
+
+def target_seconds(run):
+    """1.5x the input video's duration; 600 s when there is no video (photo sets)."""
+    video = run.get('video_seconds')
+    return 1.5 * video if video else 600.0
+
+
 def metrics(**values):
     run = _active.get()
     if run is not None:
@@ -95,8 +108,9 @@ def benchmark_run(function):
             'total_seconds': total, 'stage_seconds': seconds,
             'colmap_command_seconds': run.get('colmap_seconds', {}),
             'quality': run.get('quality', {}),
-            'runtime_target_seconds': 600,
-            'runtime_target_met': total <= 600,
+            'video_seconds': run.get('video_seconds'),
+            'runtime_target_seconds': target_seconds(run),
+            'runtime_target_met': total <= target_seconds(run),
             'absolute_accuracy': {'status': 'unverified', 'target_meters': 1,
                                   'reason': 'No geographic alignment and independent checkpoints evaluated.'},
             'preprocessing_total_seconds': preprocessing,
@@ -120,7 +134,9 @@ def benchmark_run(function):
                   for key, value in run.get('colmap_seconds', {}).items()]
         lines += [f'Quality {key}: {value:.4f}' if isinstance(value, float) else f'Quality {key}: {value}'
                   for key, value in run.get('quality', {}).items()]
-        lines += [f'Runtime target (600 s) met: {total <= 600}',
+        target = target_seconds(run)
+        basis = (f"1.5x the {run['video_seconds']:.0f} s video" if run.get('video_seconds') else 'photo set default')
+        lines += [f'Runtime target ({target:.0f} s = {basis}) met: {total <= target}',
                   'Absolute geographic accuracy: unverified (no independent checkpoint evaluation).']
         lines += [f'Preprocessing total (includes CAS and SR): {preprocessing:.2f} s',
                   f'Other/setup/cleanup: {report["other_seconds"]:.2f} s',

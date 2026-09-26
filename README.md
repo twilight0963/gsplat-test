@@ -13,6 +13,18 @@ maximum width, output folder, brightness, contrast, and sharpness. Output must b
 a new folder inside `runs/`. Uploads are kept in `runs/.uploads/` while a job runs.
 The page shows upload progress followed by the latest engine stdout/stderr line.
 
+Photo datasets can be uploaded too. Drag the folder that directly contains the photos
+(e.g. `Dataset/ATR/Images`) anywhere onto the page, or set **Input type** to *Photo
+folder* and use **Choose folder…** or **Or select photos** (for phones). Only
+JPEG/PNG/TIFF files directly inside the folder are sent; subfolders and other files
+(`Thumbs.db`, metadata text, ground-control CSVs) are ignored, so dropping
+`Dataset/ATR` itself finds no photos. Dropping a single video selects it as the input.
+The page shows how many photos will be uploaded before you start. Files are sent
+unchanged, so EXIF GPS and DJI calibration reach the engine. **Use every Nth photo**
+maps to `--photo-every` (default 2). If the browser disconnects mid-upload (page
+reloaded or closed), the server logs one line, discards the partial upload and is
+ready for the next one.
+
 When an uploaded job saves its model, the server deletes the upload from
 `runs/.uploads/` and the run's `capture/`, `capture_subset/`, `colmap/` and `sr/`
 folders. It keeps `model.glb`, `benchmark.json`, `benchmark.log` and
@@ -28,10 +40,42 @@ The engine exits after training and export. The upload page then enables another
 upload and suggests a fresh output folder automatically; no server restart is
 needed between jobs. One training job runs at a time.
 
+**Stopping a job early.** The upload page's Progress panel and the viewer's top bar
+both offer two controls while a job runs:
+
+- **Stop & save** (during training) ends training after the current step and
+  exports the model trained so far. The benchmark records the steps actually run
+  (`training_steps_completed`), and the status reads "stopped early".
+- **Discard** (any time after the upload; click twice to confirm) ends the job
+  without saving and deletes its upload and output folder. Before training starts
+  there is no model yet, so only Discard is offered. **Cancel upload** aborts an
+  upload in progress.
+
+Stop requests go through `runs/.viewer/stop.json` and name the running session, so a
+request can never stop a later job. The engine exits with code 3 when discarded.
+
+**Viewer controls.** Drag to orbit or pan (chosen in the toolbar); right-drag,
+middle-drag or Shift-drag always pans. Scroll or pinch to zoom; two fingers also
+pan on touch screens. Zoom and roll buttons repeat while held. Press **H** in the
+viewer for keyboard shortcuts (arrows, +/−, O/P, Z/C/X, U, R). The edge splat size
+limit is under **Display**. The viewer is a persistent process; when a job starts
+and finds a viewer running older code, it replaces it automatically (viewers from
+before this feature must be restarted once by hand).
+
 The live viewer runs as a separate persistent process on port 8000 and keeps the
 last model visible. When the next job reaches training, that same viewer switches
 to its previews and resets its camera and bounding box. It remains alive even if
 the upload server exits. Stop the `src.live_viewer` process to shut it down.
+
+The bounding box keeps the whole reconstruction in view. It is fitted around every
+region connected to the scene (weighted by opacity), so thin structures joined to
+it, such as towers and masts, stay inside while isolated floaters are left out; it
+follows the scene's main axes and is not forced into a cube, so wide drone sites fit
+without empty space. The same box is used for live previews (from the COLMAP
+points) and the final model, and the viewer refits saved models when it opens them,
+so models made with the older, tighter box also open in full. The starting camera
+looks down at about 32 degrees and backs off only as far as needed for the whole box
+to fit the window; **Reset** returns to that view.
 
 Preview snapshots and status are exchanged atomically through `runs/.viewer/`;
 viewer startup errors are logged in `runs/.viewer/viewer.log`. On the first launch
@@ -70,8 +114,12 @@ Selected frames and their candidate indices/reasons are recorded in
 `capture/keyframes/<input-and-settings-hash>/keyframes.json`. Original candidates
 are preserved. Benchmark reports distinguish `keyframe_candidates` from
 `frames_before_colmap`, report keyframe-selection time and individual COLMAP
-command subtotals, and state whether the completed run took at most 600 seconds.
-Command subtotals are included in COLMAP time and must not be added again.
+command subtotals, and state whether the run met the runtime target: 1.5x the
+input video's duration (e.g. a 10-minute video within 15 minutes, whatever `--every`
+is), or 600 s for photo sets. Command subtotals are included in COLMAP time and must
+not be added again. Every run also reports the final model's PSNR/SSIM on every 8th
+of the views it was trained on (`model_psnr`, `model_ssim` under `quality`); this
+shows how well the model fits its inputs, while `--eval-every` measures held-out views.
 
 Video matching uses a dense window (`quadratic_overlap=0`): COLMAP's quadratic
 mode replaces the window with gaps 1, 2, 4, 8, ..., which verified about half as

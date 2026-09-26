@@ -67,14 +67,6 @@ def validate_box(bounds):
     return bounds
 
 
-def half_volume_box(bounds):
-    """Shrink around the existing center; retain half the original volume."""
-    bounds = validate_box(bounds)
-    center = bounds.mean(axis=0)
-    half_extent = (bounds[1] - bounds[0]) * (0.5 * np.cbrt(0.5))
-    return validate_box(np.stack([center - half_extent, center + half_extent]))
-
-
 def box_mask(bounds, view, K, width, height):
     """Pixels whose forward camera ray intersects the cube (including inside views)."""
     bounds = validate_box(bounds)
@@ -123,51 +115,54 @@ def draw_box(frame, bounds, view, K):
                 cv2.line(frame, pa, pb, (80, 220, 255), 1, cv2.LINE_AA)
 
 
-def fit_subject_box(points):
-    """Fit completed geometry around its largest connected dense region.
+def fit_scene_box(points, opacities=None, grid=192, min_share=0.01, margin=0.03):
+    """Box around everything connected to the reconstructed scene.
 
-    Density guides estimation only; no rendering mask is returned. Duplicate
-    centers do not inflate support, and sparse background cannot set the center.
+    Gaussians are binned on an occupancy grid (at most `grid` cells along the
+    longest side, weighted by opacity) and grouped into connected regions. Every
+    region holding at least `min_share` of the total is kept, so thin structures
+    joined to the scene (towers, masts, bridges) stay inside, while isolated
+    floaters are left out. The box is aligned with the scene's principal axes and
+    sized per axis, so wide, flat drone scenes are not forced into a cube.
     """
+    from scipy import ndimage
     from scipy.spatial import cKDTree
     points = np.asarray(points, dtype=np.float64)
-    points = np.unique(points[np.isfinite(points).all(axis=1)], axis=0)
-    if len(points) < 17:
-        return estimate_oriented_box(points)
-    distances, _ = cKDTree(points).query(points, k=17)
-    radius = float(np.quantile(distances[:, -1], 0.6))
-    support = points[distances[:, -1] <= radius * (1 + 1e-10)]
-    if radius <= 0 or not len(support):
-        return estimate_oriented_box(points)
-    cells, inverse, counts = np.unique(
-        np.floor((support - support.min(axis=0)) / radius).astype(np.int64),
-        axis=0, return_inverse=True, return_counts=True,
-    )
-    lookup = {tuple(cell): i for i, cell in enumerate(cells)}
-    labels = np.full(len(cells), -1, dtype=int)
-    masses = []
-    offsets = [offset for offset in product((-1, 0, 1), repeat=3) if offset != (0, 0, 0)]
-    for seed in range(len(cells)):
-        if labels[seed] >= 0:
-            continue
-        label = len(masses)
-        labels[seed] = label
-        stack, mass = [seed], 0
-        while stack:
-            i = stack.pop()
-            mass += int(counts[i])
-            x, y, z = cells[i]
-            for dx, dy, dz in offsets:
-                j = lookup.get((x + dx, y + dy, z + dz))
-                if j is not None and labels[j] < 0:
-                    labels[j] = label
-                    stack.append(j)
-        masses.append(mass)
-    subject = support[labels[inverse] == np.argmax(masses)]
-    _, axes = estimate_oriented_box(subject)
-    local = subject @ axes
-    center = np.median(local, axis=0)
-    # Size symmetrically about the subject center. Do not halve afterward:
-    # that previously cropped the very region used to estimate the box.
-    half = max(float(np.quantile(np.abs(local - center), 0.99, axis=0).max()) * 1.05, 1e-3)
-    return validate_box(np.stack([center - half, center + half])), axes
+    weights = (np.ones(len(points)) if opacities is None
+               else np.clip(np.asarray(opacities, dtype=np.float64).reshape(-1), 0, 1))
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(weights)
+    visible = valid & (weights > 0.02)  # near-transparent splats do not set the bounds
+    if visible.sum() >= 16:
+        valid = visible
+    points, weights = points[valid], np.maximum(weights[valid], 1e-6)
+    _, axes = estimate_oriented_box(points)  # raises for an empty cloud
+    local = points @ axes.astype(np.float64)
+    if len(points) < 16:  # too few to judge connectivity: keep every point
+        low, high = local.min(axis=0), local.max(axis=0)
+        pad = np.maximum((high - low) * margin, 1e-3)
+        return validate_box(np.stack([low - pad, high + pad])), axes
+    # Grid over the robust extent plus a wide border; anything beyond is a far outlier.
+    lo, hi = np.quantile(local, [0.001, 0.999], axis=0)
+    lo, hi = lo - (hi - lo) * 0.25, hi + (hi - lo) * 0.25
+    # Cells at least twice the typical point spacing, so a surface is one connected
+    # region even when the cloud is sparse (e.g. COLMAP points before training).
+    sample = local if len(local) <= 50000 else local[np.random.default_rng(0).choice(len(local), 50000, replace=False)]
+    sample = np.unique(sample, axis=0)  # repeated positions must not read as zero spacing
+    spacing = float(np.median(cKDTree(sample).query(sample, k=min(4, len(sample)))[0][:, 1:].mean(axis=1)))
+    cell = max(float((hi - lo).max()) / grid, 2 * spacing, 1e-6)
+    shape = np.maximum(np.ceil((hi - lo) / cell).astype(int), 1)
+    index = np.floor((local - lo) / cell).astype(int)
+    inside = ((index >= 0) & (index < shape)).all(axis=1)
+    occupancy = np.zeros(shape, dtype=np.float64)
+    np.add.at(occupancy, tuple(index[inside].T), weights[inside])
+    labels, count = ndimage.label(occupancy > 0, structure=np.ones((3, 3, 3)))
+    if count == 0:
+        return estimate_box(local), axes
+    mass = np.asarray(ndimage.sum(occupancy, labels, index=np.arange(1, count + 1)))
+    regions = np.flatnonzero((mass >= min_share * mass.sum()) | (mass == mass.max())) + 1
+    kept = inside.copy()
+    kept[inside] = np.isin(labels[tuple(index[inside].T)], regions)
+    selected = local[kept]
+    low, high = np.quantile(selected, [0.0005, 0.9995], axis=0)
+    pad = (high - low) * margin + cell
+    return validate_box(np.stack([low - pad, high + pad])), axes
