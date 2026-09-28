@@ -54,3 +54,23 @@ class ClipTests(unittest.TestCase):
             write_gsplat_glb(p,np.zeros((1,3)),np.ones((1,3)),np.array([[1,0,0,0]]),np.ones(1),np.ones((1,3)),clip_bounds=bounds)
             np.testing.assert_array_equal(read_gsplat_glb(p)['clip_bounds'],bounds)
         with self.assertRaises(ValueError): validate_box([[0,0,0],[0,0,0]])
+
+
+class BoxMaskTorchTests(unittest.TestCase):
+    def test_matches_the_numpy_mask(self):
+        from src.clip_box import box_mask_torch
+        from src.gsplat_viewer import OrbitCamera, make_K
+        rng = np.random.default_rng(0)
+        bounds = np.array([[-1., -.5, -2.], [1.5, .5, 1.]])
+        K = make_K(96, 64, 60)
+        for azimuth, elevation, radius in ((0., .5, 6.), (2., -.3, 3.), (4., 1.2, .8), (1., 0., .2)):
+            cam = OrbitCamera(bounds.mean(0), radius)
+            cam.azimuth, cam.elevation = azimuth, elevation
+            view = cam.viewmat()
+            with self.subTest(azimuth=azimuth, radius=radius):
+                expected = box_mask(bounds, view, K, 96, 64)
+                actual = box_mask_torch(bounds, view, K, 96, 64, 'cpu').numpy()
+                self.assertLessEqual((expected != actual).sum(), 2)  # float rounding at the very edge only
+        view = rng.normal(size=(4, 4)).astype(np.float32)
+        view[:3, :3] = np.linalg.qr(view[:3, :3])[0]
+        self.assertEqual(box_mask_torch(bounds, view, K, 96, 64, 'cpu').shape, (64, 96))

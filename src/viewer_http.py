@@ -16,6 +16,12 @@ _CODE = Path(__file__).parent
 _VIEWER_FILES = ('viewer.html', 'viewer_http.py', 'gsplat_viewer.py', 'live_viewer.py', 'training_control.py')
 
 
+# Full-resolution colour (4:4:4) keeps splat edges crisp; default 4:2:0 halves colour detail.
+_JPEG_OPTIONS = [cv2.IMWRITE_JPEG_QUALITY, 92]
+if hasattr(cv2, 'IMWRITE_JPEG_SAMPLING_FACTOR'):
+    _JPEG_OPTIONS += [cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]
+
+
 def code_version():
     """Fingerprint of the viewer's code, so a job can tell whether a running viewer is outdated."""
     digest = hashlib.sha1()
@@ -97,10 +103,13 @@ class ViewerHTTP:
                 try:
                     command = self.read_json()
                     action = command['action']
-                    if action not in ('orbit', 'pan', 'zoom', 'reset', 'flip', 'left', 'right', 'straighten', 'size_clamp'):
+                    if action not in ('orbit', 'pan', 'zoom', 'reset', 'flip', 'left', 'right', 'straighten', 'size_clamp',
+                                      'resize'):
                         raise ValueError('Invalid action')
                     values = [float(command.get(k, 0)) for k in ('dx', 'dy')]
-                    if not all(math.isfinite(v) and abs(v) <= 1000 for v in values):
+                    # resize carries the page's image size in device pixels; the rest are movements.
+                    low, high = (64, 8192) if action == 'resize' else (-1000, 1000)
+                    if not all(math.isfinite(v) and low <= v <= high for v in values):
                         raise ValueError('Invalid movement')
                     if action == "size_clamp" and values[0] < 0:
                         raise ValueError("Invalid size clamp")
@@ -150,7 +159,7 @@ class ViewerHTTP:
                 'completed': state.get('completed'), 'total': state.get('total')}
 
     def publish(self, frame):
-        ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        ok, encoded = cv2.imencode('.jpg', frame, _JPEG_OPTIONS)
         if ok:
             with self.lock:
                 self.frame = encoded.tobytes()

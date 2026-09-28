@@ -92,6 +92,33 @@ def box_mask(bounds, view, K, width, height):
     return (far >= near) & (far > 0)
 
 
+def box_mask_torch(bounds, view, K, width, height, device):
+    """box_mask computed with PyTorch on `device`: the same slab test, fast enough per frame on a GPU."""
+    import torch
+    bounds = validate_box(bounds)
+    rotation = np.asarray(view[:3, :3], np.float32)
+    origin = -rotation.T @ np.asarray(view[:3, 3], np.float32)
+    x = (torch.arange(width, dtype=torch.float32, device=device) + 0.5 - float(K[0, 2])) / float(K[0, 0])
+    y = (torch.arange(height, dtype=torch.float32, device=device) + 0.5 - float(K[1, 2])) / float(K[1, 1])
+    x, y = torch.broadcast_tensors(x[None, :], y[:, None])
+    rays = torch.stack([x, y, torch.ones_like(x)], dim=-1) @ torch.from_numpy(rotation).to(device)
+    near = torch.zeros((height, width), dtype=torch.float32, device=device)
+    far = torch.full((height, width), float('inf'), dtype=torch.float32, device=device)
+    for axis in range(3):
+        direction = rays[..., axis]
+        parallel = direction.abs() < 1e-8
+        safe = torch.where(parallel, torch.ones_like(direction), direction)
+        a = (float(bounds[0, axis]) - float(origin[axis])) / safe
+        b = (float(bounds[1, axis]) - float(origin[axis])) / safe
+        lower, upper = torch.minimum(a, b), torch.maximum(a, b)
+        inside = bounds[0, axis] <= origin[axis] <= bounds[1, axis]
+        lower = torch.where(parallel, torch.full_like(lower, -np.inf if inside else np.inf), lower)
+        upper = torch.where(parallel, torch.full_like(upper, np.inf if inside else -np.inf), upper)
+        near = torch.maximum(near, lower)
+        far = torch.minimum(far, upper)
+    return (far >= near) & (far > 0)
+
+
 def draw_box(frame, bounds, view, K):
     corners = np.array(list(product(*zip(bounds[0], bounds[1]))), dtype=np.float32)
     camera = corners @ view[:3, :3].T + view[:3, 3]

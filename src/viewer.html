@@ -177,8 +177,20 @@ const frames=loop(async()=>{
  try{const frame=await request('/frame.jpg',{cache:'no-store'},async r=>{if(!r.ok)throw Error();const revision=r.headers.get('X-Frame-Revision');
    return {revision,blob:revision===null||revision!==lastRevision?await r.blob():null};});
   if(frame.blob){const next=URL.createObjectURL(frame.blob);view.src=next;if(objectURL)URL.revokeObjectURL(objectURL);objectURL=next;lastRevision=frame.revision;}
-  lastFrame=performance.now();placeholder.hidden=true;return performance.now()-lastInteraction<1500?30:120;
- }catch{placeholder.hidden=false;placeholder.textContent=lastFrame?'Reconnecting to the viewer…':'Waiting for the viewer…';return 500;}});
+  lastFrame=performance.now();placeholder.hidden=true;if(!sizeSent)sendSize();return performance.now()-lastInteraction<1500?30:120;
+ }catch{sizeSent=null;placeholder.hidden=false;placeholder.textContent=lastFrame?'Reconnecting to the viewer…':'Waiting for the viewer…';return 500;}});
+// ---- Render size: the viewer renders at the image's on-screen size in device pixels,
+// so frames are never upscaled. Sent again after a reconnect: a restarted viewer forgets it.
+let sizeSent=null,sizeTimer=null;
+function sendSize(){const box=view.getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+ const w=Math.min(8192,Math.round(box.width*ratio)),h=Math.min(8192,Math.round(box.height*ratio));
+ if(w<64||h<64)return;sizeSent=w+'x'+h;
+ for(let i=queue.length-1;i>=0;i--)if(queue[i].action==='resize')queue.splice(i,1);
+ enqueue({action:'resize',dx:w,dy:h});}
+function sizeChanged(){clearTimeout(sizeTimer);sizeTimer=setTimeout(()=>{const box=view.getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+ if(sizeSent!==Math.min(8192,Math.round(box.width*ratio))+'x'+Math.min(8192,Math.round(box.height*ratio)))sendSize();},150);}
+new ResizeObserver(sizeChanged).observe(view);
+window.addEventListener('resize',sizeChanged);  // also catches a move to a screen with another pixel density
 // ---- Controls: movements are summed and sent once per animation frame. ----
 const queue=[];let sending=false,movement=null,frameRequested=false;
 function send(action,dx=0,dy=0){lastInteraction=performance.now();

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread, Timer
@@ -22,10 +23,18 @@ from src.training_control import STOP_ACTIONS, request_stop
 
 ROOT = Path(__file__).resolve().parent.parent
 # Intermediates of an upload job, removed once its model is saved. The model,
-# benchmark reports and photo_metadata.json in the output folder are kept.
+# benchmark reports and photo_metadata.json left in the output folder are then
+# zipped into DOWNLOADS_DIR, and the output folder is deleted.
 TEMPORARY_OUTPUTS = ('capture', 'capture_subset', 'colmap', 'sr')
 # Where the engine publishes live training state (its PreviewPublisher with --use-server).
 VIEWER_DIR = ROOT / 'runs' / '.viewer'
+# The latest job's model download, kept until the next training upload.
+DOWNLOADS_DIR = ROOT / 'runs' / '.downloads'
+# An output folder name: one path component, directly inside runs/. Starting with a
+# letter or digit keeps it clear of the server's own .uploads, .viewer and .downloads.
+OUTPUT_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
+MAX_MODEL = 8 * 1024 ** 3
+MODEL_TYPES = ('model/gltf-binary', 'application/octet-stream')
 # The engine's exit code for "stopped by the user, nothing saved" (src/engine.py).
 STOPPED_EXIT_CODE = 3
 # Engine output line -> pipeline stage shown on the upload page.
@@ -181,12 +190,13 @@ def parameters(query, swinir_root=None, sr_checkpoint=None):
 
 
 def _add_output(result, values):
-    output = values.get('output', ['runs/web-' + uuid.uuid4().hex[:8]])[0]
-    path = (ROOT / output).resolve()
-    if not path.is_relative_to(ROOT / 'runs') or path == ROOT / 'runs':
-        raise ValueError('Output must be a new folder inside runs/')
+    name = values.get('output', ['web-' + uuid.uuid4().hex[:8]])[0]
+    if not OUTPUT_NAME.fullmatch(name):
+        raise ValueError("Output folder name must be 1-100 letters, digits, '.', '-' or '_', "
+                         "starting with a letter or digit")
+    path = ROOT / 'runs' / name
     if path.exists():
-        raise ValueError('Output folder already exists; choose a new name')
+        raise ValueError('Output folder already exists in runs/; choose a new name')
     result['output'] = str(path)
     # Uploaded jobs always use the persistent browser viewer. This is fixed by
     # the server and cannot be overridden by request parameters.
@@ -298,27 +308,68 @@ def clean_up(upload, output):
     return freed
 
 
+def package_run(output, downloads=None):
+    """Zip a saved run's remaining files into `downloads`/<name>.zip, then delete the run folder.
+
+    The archive holds one folder named after the run. Models are stored as they are,
+    since they barely compress and deflating them would only add time.
+    """
+    runs = (ROOT / 'runs').resolve()
+    output = Path(output)
+    if output.resolve().parent != runs or output.is_symlink() or not output.is_dir():
+        raise ValueError(f'Refusing to package a folder that is not directly inside runs/: {output}')
+    downloads = Path(DOWNLOADS_DIR if downloads is None else downloads)
+    downloads.mkdir(parents=True, exist_ok=True)
+    archive = downloads / (output.name + '.zip')
+    temporary = downloads / (output.name + '.zip.tmp')
+    try:
+        with zipfile.ZipFile(temporary, 'w') as bundle:
+            for path in sorted(output.rglob('*')):
+                if path.is_file() and not path.is_symlink():
+                    kind = zipfile.ZIP_STORED if path.suffix.lower() == '.glb' else zipfile.ZIP_DEFLATED
+                    bundle.write(path, Path(output.name) / path.relative_to(output), compress_type=kind)
+        temporary.replace(archive)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    shutil.rmtree(output)
+    return archive
+
+
+def clear_downloads(downloads=None):
+    """Delete earlier model downloads (a browser still reading one keeps its open copy)."""
+    downloads = Path(DOWNLOADS_DIR if downloads is None else downloads)
+    for path in downloads.glob('*.zip*') if downloads.is_dir() else ():
+        path.unlink(missing_ok=True)
+
+
 class Jobs:
     def __init__(self):
         self.lock = Lock()
         self.process = None
-        self.job = None  # (upload, output) of the running job
+        self.job = None  # (upload, output) of the running training job
+        self.model = None  # the uploaded .glb of a running open-model job
+        self.kind = 'train'
         self.state = self._fresh_state(busy=False, status='Ready to upload', stage='idle')
 
     @staticmethod
     def _fresh_state(**values):
         return {'busy': False, 'status': '', 'viewer': False, 'saved': False, 'stage': 'idle',
-                'progress': None, 'step': None, 'steps': None, 'stopping': None, **values}
+                'progress': None, 'step': None, 'steps': None, 'stopping': None, 'download': None, **values}
 
     def snapshot(self):
         with self.lock:
             return dict(self.state)
 
-    def reserve(self):
+    def reserve(self, keep_download=False):
+        """Claim the server for one job. A new training job replaces the previous model download."""
         with self.lock:
             if self.state['busy'] or (self.process is not None and self.process.poll() is None):
                 raise ValueError('A training job is already running. Wait for it to finish before uploading again.')
-            self.state = self._fresh_state(busy=True, status='Receiving upload…', stage='upload')
+            download = self.state['download'] if keep_download else None
+            self.state = self._fresh_state(busy=True, status='Receiving upload…', stage='upload', download=download)
+        if not keep_download:
+            clear_downloads()
 
     def fail(self, message):
         with self.lock:
@@ -336,6 +387,8 @@ class Jobs:
                 raise StopRejected('The upload is still in progress; cancel it on the upload page.')
             if not self.state['busy'] or process is None or process.poll() is not None:
                 raise StopRejected('No job is running.')
+            if self.kind == 'open':
+                raise StopRejected('Opening a model takes only a few seconds and cannot be stopped.')
             if action == 'save' and stage != 'train':
                 raise StopRejected('There is no model to save before training starts; discard the job instead.')
             self.state['stopping'] = action
@@ -382,7 +435,19 @@ class Jobs:
             command.append('--' + key)
             if value is not None:
                 command.append(value)
-        self.job = (Path(video), Path(params['output']))
+        self.kind, self.job, self.model = 'train', (Path(video), Path(params['output'])), None
+        self._start(command)
+
+    def launch_open(self, model, name):
+        """Show an uploaded .glb in the persistent viewer; the upload is deleted afterwards."""
+        # --name=... keeps a name starting with '-' from being read as an option.
+        command = [sys.executable, '-u', '-m', 'src.open_model', str(model), '--name=' + name]
+        self.kind, self.job, self.model = 'open', None, Path(model)
+        with self.lock:
+            self.state.update(stage='open', status=f'Opening {name}…')
+        self._start(command)
+
+    def _start(self, command):
         self.process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
         Thread(target=self.monitor, daemon=True).start()
@@ -407,20 +472,30 @@ class Jobs:
                 line = (line + char)[-4000:]
         process.stdout.close()
         code = process.wait()
+        if self.kind == 'open':
+            self._finish_open(code)
+            return
         with self.lock:
             stopping = self.state['stopping']
         saved = not code and self.job is not None and (self.job[1] / 'model.glb').is_file()
         stopped = not saved and (code == STOPPED_EXIT_CODE or (stopping == 'discard' and code))
-        note, stage = None, 'failed' if code else 'done'
+        note, stage, download = None, 'failed' if code else 'done', None
         if saved:
             # Failed jobs keep their upload and intermediates for inspection or a retry.
             early = ' (stopped early)' if stopping == 'save' else ''
+            model = self.job[1] / 'model.glb'
             try:
                 freed = clean_up(*self.job)
-                note = (f'Model saved{early}: {self.job[1] / "model.glb"}. '
-                        f'Removed temporary files ({freed / 1024 ** 3:.2f} GiB).')
+                cleaned = f'Removed temporary files ({freed / 1024 ** 3:.2f} GiB).'
             except (OSError, ValueError) as exc:
-                note = f'Model saved{early}: {self.job[1] / "model.glb"}. Could not remove temporary files: {exc}'
+                cleaned = f'Could not remove temporary files: {exc}'
+            try:
+                archive = package_run(self.job[1])
+                download = archive.name
+                note = (f'Model saved{early}: {archive.name} ({archive.stat().st_size / 1024 ** 2:.1f} MiB) '
+                        f'is ready to download; the run folder was removed. {cleaned}')
+            except (OSError, ValueError) as exc:
+                note = f'Model saved{early}: {model}. Could not package the download: {exc}. {cleaned}'
         elif stopped and self.job is not None:
             stage = 'stopped'
             try:
@@ -431,12 +506,20 @@ class Jobs:
         if note:
             print(note, flush=True)
         with self.lock:
-            self.state.update(busy=False, stage=stage, stopping=None)
+            self.state.update(busy=False, stage=stage, stopping=None, download=download)
             # The detached viewer survives engine exit.
             if note:
                 self.state['status'] = note
             elif code:
                 self.state['status'] = f'Failed (exit {code}): ' + self.state['status']
+
+    def _finish_open(self, code):
+        if self.model is not None:
+            self.model.unlink(missing_ok=True)
+        with self.lock:
+            self.state.update(busy=False, stage='failed' if code else 'opened', stopping=None)
+            if code:
+                self.state['status'] = f'Could not open the model (exit {code}): ' + self.state['status']
 
     def close(self):
         if self.process is not None and self.process.poll() is None:
@@ -479,6 +562,8 @@ def make_server(host, port, jobs, *, swinir_root=None, sr_checkpoint=None):
                 self.reply(200, page, 'text/html; charset=utf-8')
             elif path == '/status':
                 self.reply(200, json.dumps(jobs.snapshot()).encode())
+            elif path.startswith('/download/'):
+                self.download(path[len('/download/'):])
             elif path == '/check':
                 # Validates upload settings before the page sends a large file.
                 try:
@@ -490,8 +575,68 @@ def make_server(host, port, jobs, *, swinir_root=None, sr_checkpoint=None):
             else:
                 self.reply(404, b'{}')
 
+        def download(self, name):
+            """Send the latest job's model zip; nothing else in runs/ is ever served."""
+            current = jobs.snapshot()['download']
+            try:
+                if not current or name != current:
+                    raise FileNotFoundError
+                archive = (DOWNLOADS_DIR / current).open('rb')
+            except FileNotFoundError:
+                self.reply(404, json.dumps({'error': 'No model download is available; it is replaced by the next job.'}).encode())
+                return
+            with archive:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Length', str(Path(archive.name).stat().st_size))
+                # `current` is an OUTPUT_NAME plus .zip, so it needs no quoting.
+                self.send_header('Content-Disposition', f'attachment; filename="{current}"')
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                try:
+                    shutil.copyfileobj(archive, self.wfile, 1024 * 1024)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # The browser cancelled the download; the zip stays available.
+
+        def open_model(self, query):
+            reserved = False
+            model = None
+            try:
+                name = parse_qs(query).get('name', ['model.glb'])[0]
+                name = ''.join(c for c in name if c.isprintable())[:200] or 'model.glb'
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= MAX_MODEL:
+                    raise ValueError('The model must be between 1 byte and 8 GiB')
+                if self.headers.get('Content-Type') not in MODEL_TYPES:
+                    raise ValueError('Expected a .glb model')
+                # Opening a model keeps the latest job's download available.
+                jobs.reserve(keep_download=True)
+                reserved = True
+                directory = ROOT / 'runs' / '.uploads'
+                directory.mkdir(parents=True, exist_ok=True)
+                self.connection.settimeout(120)
+                model = directory / (uuid.uuid4().hex + '.glb')
+                with model.open('xb') as output:
+                    _copy(self.rfile, output, length)
+                with model.open('rb') as saved:
+                    if saved.read(4) != b'glTF':
+                        raise ValueError('That file is not a .glb model')
+                jobs.launch_open(model, name)
+                self.reply(202, b'{"ok":true}')
+            except (ValueError, OSError) as exc:
+                if isinstance(exc, (UploadInterrupted, ConnectionResetError, BrokenPipeError)):
+                    exc = UploadInterrupted('Upload interrupted: the browser closed the connection')
+                if reserved:
+                    jobs.fail(str(exc))
+                    if model is not None:
+                        model.unlink(missing_ok=True)
+                self.reply(400, json.dumps({'error': str(exc)}).encode())
+
         def do_POST(self):
             url = urlsplit(self.path)
+            if url.path == '/open-model':
+                self.open_model(url.query)
+                return
             if url.path == '/stop':
                 try:
                     length = int(self.headers.get('Content-Length', '0'))

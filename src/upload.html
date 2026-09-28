@@ -174,6 +174,7 @@ details.more .fields{margin-top:.9rem}
 .headline{margin:0 0 .75rem;font-size:1.25rem;font-weight:650;letter-spacing:-.015em}
 .log{margin:.9rem 0 0;padding:.7rem .8rem;border-radius:11px;background:var(--recessed);box-shadow:var(--shadow-recessed);font:.8rem/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--subtext1);white-space:pre-wrap;overflow-wrap:anywhere;max-height:7.5rem;overflow:auto}
 .job-actions{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1rem}
+.top-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.5rem}
 .notice{margin-top:.8rem;font-size:.875rem;color:var(--subtext1)}
 .notice.error{color:#a30b2d}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}.btn:active,.preset:hover,.preset:active{transform:none}.drop.over{transform:none}.meter.indeterminate>div{width:100%;opacity:.35}}
@@ -188,7 +189,11 @@ details.more .fields{margin-top:.9rem}
    <path d="M9 24l6-8 5 5 4-6 5 9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="26" cy="11.5" r="2.4" fill="#fff"/><path d="M11 8.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" fill="#fff" opacity=".85"/></svg>
   <div><h1>Flyby Render</h1><p>Drone video or photos → 3D Gaussian splat model</p></div>
  </div>
- <a class="btn" id="viewer" target="flyby-viewer" aria-disabled="true" title="Available once training starts">Open viewer ↗</a>
+ <div class="top-actions">
+  <button type="button" class="btn" id="open-model" title="Show a saved .glb model in the viewer">Open model…</button>
+  <a class="btn" id="viewer" target="flyby-viewer" aria-disabled="true" title="Available once training starts">Open viewer ↗</a>
+ </div>
+ <input id="model-file" type="file" accept=".glb,model/gltf-binary" hidden>
 </header>
 <main class="layout">
 <form id="form" novalidate>
@@ -237,7 +242,7 @@ details.more .fields{margin-top:.9rem}
   <div class="fields">
    <label class="field" id="every-input"><span>Keep every Nth frame</span><input name="every" type="number" value="5" min="1" max="100000" required><small>Higher skips more frames and runs faster.</small></label>
    <label class="field" id="photo-every-input" hidden><span>Use every Nth photo</span><input name="photo-every" type="number" value="2" min="1" max="1000" required disabled><small>1 uses all photos; matching time grows with the count.</small></label>
-   <label class="field"><span>Output folder</span><input name="output" type="text" required pattern="runs/.+" spellcheck="false" autocomplete="off"><small id="output-hint">A new folder inside <code>runs/</code>.</small></label>
+   <label class="field"><span>Output folder</span><input name="output" type="text" required pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,99}" maxlength="100" spellcheck="false" autocomplete="off" title="Letters, digits, dots, dashes and underscores, starting with a letter or digit"><small id="output-hint">A new folder inside <code>runs/</code>.</small></label>
   </div>
   <details class="more" id="adjustments">
    <summary>Image adjustments <span class="hint">Brightness, contrast, sharpening</span></summary>
@@ -284,6 +289,7 @@ details.more .fields{margin-top:.9rem}
  <div class="meter" id="meter" role="progressbar" aria-labelledby="headline" aria-valuemin="0" aria-valuemax="100"><div></div></div>
  <div class="meter-row"><span id="meter-label">Waiting for an upload</span><span id="meter-value"></span></div>
  <div class="job-actions">
+  <a class="btn primary" id="download" hidden download title="The model and its benchmark reports, available until the next training job">Download model (.zip)</a>
   <button type="button" class="btn" id="cancel-upload" hidden>Cancel upload</button>
   <button type="button" class="btn" id="stop-save" hidden title="End training now and save the model trained so far">Stop &amp; save</button>
   <button type="button" class="btn danger" id="discard" hidden title="End the job and delete its files">Discard</button>
@@ -295,7 +301,9 @@ details.more .fields{margin-top:.9rem}
 <script>
 const form=document.querySelector('#form'),statusBox=document.querySelector('#status'),build=document.querySelector('#build'),link=document.querySelector('#viewer');
 const $=selector=>document.querySelector(selector);
-form.elements.output.value='runs/web-'+new Date().toISOString().replace(/[:.]/g,'-');
+// A fresh output folder name; the server keeps every run inside runs/.
+function newRunName(){return 'web-'+new Date().toISOString().replace(/[:.]/g,'-');}
+form.elements.output.value=newRunName();
 const viewerURL=new URL(location.href);viewerURL.port='8000';viewerURL.pathname='/';viewerURL.search='';viewerURL.hash='';link.href=viewerURL.href;
 // Selection feedback, shown under the drop zone.
 function showSelection(text,kind){const box=$('#selection');box.className='selection'+(kind?' '+kind:'');$('#selection-text').textContent=text;}
@@ -361,7 +369,7 @@ function syncFields(){const custom=quality()==='custom',mode=currentMode();
  for(const [key,ids] of Object.entries(modeInputs))for(const id of ids){const box=document.getElementById(id),show=key===mode&&!custom;box.hidden=!show;for(const input of box.querySelectorAll('input'))input.disabled=!show;}
  const adjustments=$('#adjustments');adjustments.hidden=custom;for(const input of adjustments.querySelectorAll('input,select'))input.disabled=custom;
  $('#command-panel').hidden=!custom;argsBox.disabled=!custom;
- $('#output-hint').innerHTML=custom?'Passed as <code>--output</code>.':'Save path';
+ $('#output-hint').innerHTML=custom?'Passed as <code>--output</code>.':'Save path.';
  $('#preset-hint').textContent=PRESET_HINT[quality()];}
 for(const radio of form.querySelectorAll('input[name="quality"]'))radio.onchange=()=>{const q=quality();
  if(q!=='custom')basePreset=q;else if(!argsEdited)fillArgs();syncFields();if(q==='custom')checkArgsSoon();};
@@ -410,7 +418,7 @@ function validate(){for(const input of form.querySelectorAll('input,select'))inp
 form.addEventListener('input',e=>{if(e.target.classList.contains('invalid')&&e.target.checkValidity())e.target.classList.remove('invalid');});
 // Progress panel
 const STAGES=['upload','prepare','reconstruct','train','save'];
-const STAGE_TEXT={idle:'Ready',upload:'Uploading',prepare:'Preparing input',reconstruct:'Reconstructing cameras',train:'Training',save:'Saving model',done:'Model saved',failed:'Failed',stopped:'Stopped'};
+const STAGE_TEXT={idle:'Ready',upload:'Uploading...',prepare:'Preparing input...',reconstruct:'Reconstructing...',train:'Training...',save:'Saving model...',done:'Model saved.',failed:'Failed.',stopped:'Stopped.',open:'Opening model.',opened:'Model opened.'};
 let submitted=false,navigated=false,uploading=false,checking=false,completionHandled=false,lastStage='idle',xhr=null,uploadPercent=0,server={};
 function setMeter(percent,label,value){const meter=$('#meter');meter.classList.toggle('indeterminate',percent===null);
  meter.firstElementChild.style.width=percent===null?'':percent+'%';if(percent===null)meter.removeAttribute('aria-valuenow');else meter.setAttribute('aria-valuenow',String(Math.round(percent)));
@@ -418,8 +426,10 @@ function setMeter(percent,label,value){const meter=$('#meter');meter.classList.t
 function notice(text,isError){const box=$('#notice');box.hidden=!text;box.textContent=text||'';box.classList.toggle('error',!!isError);}
 function render(){
  const stage=uploading?'upload':(server.stage||'idle');if(STAGES.includes(stage))lastStage=stage;
- const finished=['done','failed','stopped'].includes(stage),index=STAGES.indexOf(finished?lastStage:stage);
+ const finished=['done','failed','stopped','opened'].includes(stage),index=STAGES.indexOf(finished?lastStage:stage);
+ const opening=stage==='open'||stage==='opened';  // an Open model job: uploaded, then shown; no pipeline stages
  for(const [i,item] of Array.from($('#stages').children).entries()){item.className='';
+  if(opening){item.className=i===0?'done':'';item.setAttribute('aria-current','false');continue;}
   if(stage==='done')item.className='done';
   else if(finished&&i===index&&stage!=='done')item.className='failed';
   else if(i<index)item.className='done';else if(i===index&&!finished)item.className='active';
@@ -428,22 +438,30 @@ function render(){
  if(stage==='upload')setMeter(uploadPercent,'Uploading',uploadPercent.toFixed(1)+'%');
  else if(stage==='train'&&server.progress!=null)setMeter(server.progress,`Step ${server.step} of ${server.steps}`,server.progress.toFixed(1)+'%');
  else if(stage==='done')setMeter(100,'Finished','100%');
+ else if(stage==='opened')setMeter(100,'Showing in the viewer','100%');
  else if(stage==='idle'||stage==='failed'||stage==='stopped')setMeter(0,stage==='idle'?'Waiting for an upload':'Not running','');
  else setMeter(null,STAGE_TEXT[stage]||'Working…','');
  const busy=uploading||!!server.busy,stopping=!!server.stopping;
  $('#cancel-upload').hidden=!uploading;
  $('#stop-save').hidden=uploading||stage!=='train'||stopping;
- $('#discard').hidden=uploading||!server.busy||stage==='upload'||stopping;
+ $('#discard').hidden=uploading||!server.busy||stage==='upload'||stage==='open'||stopping;
+ $('#open-model').disabled=busy||checking;
+ const download=$('#download');download.hidden=!server.download;if(server.download)download.href='/download/'+encodeURIComponent(server.download);
  build.disabled=busy||checking;$('#submit-hint').textContent=busy?'Current job is running. Stop it or wait for it to finish before starting another.':checking?'Checking settings…':'Page will automatically open viewer once training begins.';
  link.setAttribute('aria-disabled',server.viewer?'false':'true');link.title=server.viewer?'Open the live viewer in a new tab':'Available once training starts';
 }
 // Requests never wait forever: a stalled one (sleep/wake, network change) is cancelled.
 async function request(url,options,read){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),6000);
  try{const r=await fetch(url,{...options,signal:controller.signal});return await read(r);}finally{clearTimeout(timer);}}
+// Starts the zip download once, when a job finishes; the Download button stays for another try.
+function startDownload(name){const a=document.createElement('a');a.href='/download/'+encodeURIComponent(name);a.download=name;document.body.append(a);a.click();a.remove();}
 let pollGeneration=0,pollTimer=null,pollTick=0;
 function startPolling(){pollGeneration++;clearTimeout(pollTimer);poll(pollGeneration);}
 async function poll(generation){pollTick=performance.now();try{server=await request('/status',{cache:'no-store'},async r=>{if(!r.ok)throw Error();return r.json();});statusBox.textContent=server.status;
- if(submitted&&!uploading&&!server.busy&&server.saved&&!completionHandled){completionHandled=true;form.elements.output.value='runs/web-'+new Date().toISOString().replace(/[:.]/g,'-');notice('Model saved. Ready for another upload; the viewer stays open.');}
+ if(submitted&&!uploading&&!server.busy&&server.saved&&!completionHandled){completionHandled=true;form.elements.output.value=newRunName();
+  if(server.download){startDownload(server.download);notice('Model saved, download should\'ve started automatically. Alternatively, click download button.');}
+  else notice('Ready for another upload!!');}
+ if(submitted&&!uploading&&!server.busy&&server.stage==='opened'&&!completionHandled){completionHandled=true;notice('Model opened in the viewer.');}
  if(submitted&&!uploading&&server.viewer&&!navigated){navigated=true;const tab=window.open(viewerURL.href,'flyby-viewer');  // one reused viewer tab, not a new one per job
 if(tab){tab.opener=null;}else{notice('The viewer is ready but the popup was blcoked, use “Open viewer”.');}}
 }catch{statusBox.textContent='Cannot reach the upload server. Please report this on the git repostiory as an issue.';}render();if(generation===pollGeneration)pollTimer=setTimeout(()=>poll(generation),700);}
@@ -484,12 +502,21 @@ form.onsubmit=async e=>{e.preventDefault();if(uploading||checking||server.busy)r
   if(problem.startsWith('Output')){const output=form.elements.output;output.classList.add('invalid');output.focus();}
   else if(quality()==='custom'){setArgsStatus(problem,'error');argsBox.focus();}
   render();return;}
+ sendUpload('/upload?'+params,kind,body,'Upload complete. Processing '+noun+'…');};
+// Sends an upload with progress; the server answers 202 once the job has started.
+function sendUpload(url,kind,body,accepted){
  submitted=false;navigated=false;completionHandled=false;uploading=true;uploadPercent=0;render();
- xhr=new XMLHttpRequest();xhr.open('POST','/upload?'+params);xhr.setRequestHeader('Content-Type',kind);
+ xhr=new XMLHttpRequest();xhr.open('POST',url);xhr.setRequestHeader('Content-Type',kind);
  xhr.upload.onprogress=e=>{if(e.lengthComputable){uploadPercent=100*e.loaded/e.total;render();}};
- xhr.onload=function(){uploading=false;xhr=null;if(this.status===202){submitted=true;notice('Upload complete. Processing '+noun+'…');}else{let text='Upload failed';try{text=JSON.parse(this.responseText).error||text;}catch{}notice(text,true);}render();};
+ xhr.onload=function(){uploading=false;xhr=null;if(this.status===202){submitted=true;notice(accepted);}else{let text='Upload failed';try{text=JSON.parse(this.responseText).error||text;}catch{}notice(text,true);}render();};
  xhr.onerror=()=>{uploading=false;xhr=null;notice('Upload connection failed.',true);render();};
  xhr.onabort=()=>{uploading=false;xhr=null;notice('Upload cancelled.');render();};
- xhr.send(body);};
+ xhr.send(body);}
+// Open model: upload a saved .glb and show it in the viewer, when no job is running.
+const modelFile=$('#model-file');
+$('#open-model').onclick=()=>{if(!uploading&&!checking&&!server.busy)modelFile.click();};
+modelFile.onchange=()=>{const file=modelFile.files[0];modelFile.value='';if(!file||uploading||checking||server.busy)return;
+ if(!/\.glb$/i.test(file.name)){notice('Choose a .glb model file.',true);return;}
+ notice('');sendUpload('/open-model?'+new URLSearchParams({name:file.name}),'model/gltf-binary',file,'Opening '+file.name+' in the viewer…');};
 setMode();startPolling();
 </script></body></html>

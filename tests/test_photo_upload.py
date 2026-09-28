@@ -12,12 +12,21 @@ import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from threading import Thread
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from src import upload_server
 from src.upload_server import Jobs, PHOTO_BATCH, make_server, receive_photos
+
+
+def setUpModule():
+    # Jobs.reserve() clears the model downloads; keep tests away from the real runs/.downloads.
+    downloads = tempfile.TemporaryDirectory()
+    patcher = patch.object(upload_server, 'DOWNLOADS_DIR', Path(downloads.name))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(downloads.cleanup)
 
 
 def batch(*files):
@@ -76,7 +85,7 @@ class HttpPhotoUploadTests(unittest.TestCase):
         self.thread.join()
 
     def post(self, body, kind, query=''):
-        request = Request(f'{self.base}/upload?output=runs/test-{uuid.uuid4().hex}{query}', data=body,
+        request = Request(f'{self.base}/upload?output=test-{uuid.uuid4().hex}{query}', data=body,
                           headers={'Content-Type': kind})
         with urlopen(request, timeout=5) as response:
             return response.status
@@ -113,7 +122,7 @@ class HttpPhotoUploadTests(unittest.TestCase):
                 output = io.StringIO()
                 with redirect_stdout(output), socket.create_connection(('127.0.0.1', self.server.server_port)) as sock:
                     # Announce 1 MB, send a fragment, then close as a reloaded page would.
-                    sock.sendall((f'POST /upload?output=runs/test-{uuid.uuid4().hex} HTTP/1.1\r\n'
+                    sock.sendall((f'POST /upload?output=test-{uuid.uuid4().hex} HTTP/1.1\r\n'
                                   f'Host: x\r\nContent-Type: {kind}\r\nContent-Length: 1000000\r\n\r\n').encode()
                                  + batch(('a.jpg', b'x' * 100))[:50])
                     sock.shutdown(socket.SHUT_WR)

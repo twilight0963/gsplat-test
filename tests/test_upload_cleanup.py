@@ -6,10 +6,20 @@ import unittest
 import uuid
 from pathlib import Path
 import unittest.mock
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+import zipfile
 
 from src import upload_server
 from src.upload_server import Jobs, clean_up
+
+
+def setUpModule():
+    # Jobs.reserve() clears the model downloads; keep tests away from the real runs/.downloads.
+    downloads = tempfile.TemporaryDirectory()
+    patcher = patch.object(upload_server, 'DOWNLOADS_DIR', Path(downloads.name))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(downloads.cleanup)
 
 
 class CleanupTests(unittest.TestCase):
@@ -43,17 +53,44 @@ class CleanupTests(unittest.TestCase):
         jobs.monitor()
         return jobs.snapshot()
 
-    def test_success_removes_intermediates_and_keeps_model_and_reports(self):
+    def test_success_zips_model_and_reports_then_removes_the_run(self):
         for photos in (True, False):
             with self.subTest(photos=photos):
                 upload, output = self.make_job(photos)
                 state = self.run_monitor(upload, output, 0)
                 self.assertFalse(upload.exists())
-                self.assertEqual(sorted(p.name for p in output.iterdir()),
-                                 ['benchmark.json', 'benchmark.log', 'model.glb', 'photo_metadata.json'])
+                self.assertFalse(output.exists())
+                self.assertEqual(state['download'], output.name + '.zip')
+                with zipfile.ZipFile(upload_server.DOWNLOADS_DIR / state['download']) as bundle:
+                    names = {info.filename: info for info in bundle.infolist()}
+                    self.assertEqual(sorted(names), sorted(f'{output.name}/{name}' for name in
+                                     ('benchmark.json', 'benchmark.log', 'model.glb', 'photo_metadata.json')))
+                    self.assertEqual(names[f'{output.name}/model.glb'].compress_type, zipfile.ZIP_STORED)
+                    self.assertEqual(bundle.read(f'{output.name}/benchmark.log'), b'd' * 9)
                 self.assertFalse(state['busy'])
                 self.assertTrue(state['saved'])
+                self.assertIn('ready to download', state['status'])
                 self.assertIn('Removed temporary files', state['status'])
+
+    def test_a_new_training_job_replaces_the_download_but_opening_a_model_keeps_it(self):
+        upload, output = self.make_job()
+        download = upload_server.DOWNLOADS_DIR / self.run_monitor(upload, output, 0)['download']
+        jobs = Jobs()
+        jobs.state['download'] = download.name
+        jobs.reserve(keep_download=True)
+        self.assertEqual(jobs.snapshot()['download'], download.name)
+        self.assertTrue(download.exists())
+        jobs.state['busy'] = False
+        jobs.reserve()
+        self.assertIsNone(jobs.snapshot()['download'])
+        self.assertFalse(download.exists())
+
+    def test_package_refuses_folders_not_directly_in_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for folder in (Path(tmp), upload_server.ROOT / 'runs'):
+                with self.subTest(folder=folder), self.assertRaises(ValueError):
+                    upload_server.package_run(folder)
+            self.assertTrue(Path(tmp).exists())
 
     def test_freed_size_counts_hard_links_once(self):
         upload, output = self.make_job()

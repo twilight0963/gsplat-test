@@ -10,10 +10,10 @@ import argparse
 from threading import Lock
 from queue import Empty
 import math
-from time import sleep
+from time import monotonic, sleep
 from src.viewer_http import ViewerHTTP
 from itertools import product
-from src.clip_box import fit_scene_box, validate_box, validate_axes, box_view, box_mask, draw_box
+from src.clip_box import fit_scene_box, validate_box, validate_axes, box_view, box_mask_torch, draw_box
 
 
 class TrainingPreview:
@@ -54,6 +54,18 @@ from src.gltf_gsplat import read_gsplat_glb
 # Default viewing angle above the scene's ground plane: an oblique drone-style view
 # (about 32 degrees) shows more of a wide, flat site than a near-horizontal one.
 DEFAULT_ELEVATION = 0.55
+# The browser page asks for frames at its on-screen size (times the display's pixel
+# density); this caps the long side so large or high-DPI windows keep a usable frame rate.
+MAX_RENDER_SIDE = 2560
+# Browser controls within this many seconds count as one drag: frames render at
+# interactive_scale, then one full-resolution frame follows once they stop.
+INTERACTION_SECONDS = 0.15
+
+
+def render_size(width: float, height: float, max_side: int = MAX_RENDER_SIDE) -> tuple[int, int]:
+    """A requested frame size, scaled down to fit `max_side` and rounded to even pixels."""
+    scale = min(1.0, max_side / max(width, height, 1.0))
+    return max(64, round(width * scale / 2) * 2), max(64, round(height * scale / 2) * 2)
 
 
 class OrbitCamera:
@@ -284,10 +296,16 @@ def start_viewer(
 
     interactive_scale = min(max(interactive_scale, 0.1), 1.0)
     render_w, render_h = width, height
-    fast_w = max(1, round(width * interactive_scale))
-    fast_h = max(1, round(height * interactive_scale))
-    K_full = torch.from_numpy(make_K(width, height, fov)).to(device).unsqueeze(0)
-    K_fast = torch.from_numpy(make_K(fast_w, fast_h, fov)).to(device).unsqueeze(0)
+
+    def intrinsics(width, height):
+        """Full and interactive render sizes and camera matrices for a frame size."""
+        fast_w = max(1, round(width * interactive_scale))
+        fast_h = max(1, round(height * interactive_scale))
+        return (fast_w, fast_h, torch.from_numpy(make_K(width, height, fov)).to(device).unsqueeze(0),
+                torch.from_numpy(make_K(fast_w, fast_h, fov)).to(device).unsqueeze(0))
+
+    fast_w, fast_h, K_full, K_fast = intrinsics(width, height)
+    last_motion = -math.inf
 
     window = "gsplat viewer"
     web = None
@@ -386,6 +404,22 @@ def start_viewer(
                         action, dx, dy = web.commands.get_nowait()
                     except Empty:
                         break
+                    if action == "resize":
+                        # The page's image size in device pixels, so frames are not upscaled.
+                        size = render_size(dx, dy)
+                        if size != (width, height):
+                            width, height = size
+                            fast_w, fast_h, K_full, K_fast = intrinsics(width, height)
+                            cached_view = None
+                            if cam is not None:
+                                # Keep the user's zoom, but re-frame a camera they have not zoomed,
+                                # since a narrower window shows less of the scene at the same distance.
+                                reframe = cam.radius == cam.default_radius
+                                radius = cam.radius
+                                cam.default_radius = framing_radius(
+                                    cam, clip_bounds, clip_axes, make_K(width, height, fov), width, height)
+                                cam.radius = cam.default_radius if reframe else radius
+                        continue
                     if action == "size_clamp":
                         size_clamp_multiplier = dx
                         if source_scales is not None:
@@ -394,6 +428,8 @@ def start_viewer(
                         continue
                     if cam is None:
                         continue
+                    if action in ("orbit", "pan", "zoom", "left", "right"):
+                        last_motion = monotonic()
                     if action == "orbit":
                         cam.azimuth -= dx * 0.005
                         cam.elevation = np.clip(cam.elevation + dy * 0.005, -1.5, 1.5)
@@ -412,7 +448,8 @@ def start_viewer(
                     elif action == "straighten":
                         cam.straighten()
 
-            fast = state["dragging"] is not None and interactive_scale < 1.0
+            moving = state["dragging"] is not None or monotonic() - last_motion < INTERACTION_SECONDS
+            fast = moving and interactive_scale < 1.0
             render_w, render_h = (fast_w, fast_h) if fast else (width, height)
             K_t = K_fast if fast else K_full
             view = cam.viewmat() if cam is not None else None
@@ -426,17 +463,26 @@ def start_viewer(
                             means, quats, scales, opacities, colors,
                             viewmat, K_t, render_w, render_h, packed=True,
                         )
-                        frame = rendered[0].clamp(0, 1).mul(255).to(torch.uint8)[..., [2, 1, 0]]
-                        frame_bgr = frame.contiguous().cpu().numpy()
+                        rendered = rendered[0]
                     else:
-                        frame_bgr = np.zeros((render_h, render_w, 3), dtype=np.uint8)
-                if fast:
-                    frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
-                # Mask after resizing too, so interpolation cannot bleed past the boundary.
+                        rendered = torch.zeros((render_h, render_w, 3), device=means.device)
+                    if fast and desktop:
+                        # The desktop window shows frames at full size; the browser scales a
+                        # smaller frame itself, so it is sent as rendered.
+                        rendered = torch.nn.functional.interpolate(
+                            rendered.permute(2, 0, 1)[None], size=(height, width), mode="bilinear",
+                            align_corners=False)[0].permute(1, 2, 0)
+                    frame_h, frame_w = rendered.shape[:2]
+                    if bounding_box:
+                        # Masked on the GPU (a per-pixel test on the CPU cost ~200 ms at 1440p),
+                        # after any resize, so interpolation cannot bleed past the boundary.
+                        K_display = make_K(frame_w, frame_h, fov)
+                        clip_view = box_view(view, clip_axes)
+                        inside = box_mask_torch(clip_bounds, clip_view, K_display, frame_w, frame_h, rendered.device)
+                        rendered = rendered * inside[..., None]
+                    frame = rendered.clamp(0, 1).mul(255).to(torch.uint8)[..., [2, 1, 0]]
+                    frame_bgr = frame.contiguous().cpu().numpy()
                 if bounding_box:
-                    K_display = make_K(width, height, fov)
-                    clip_view = box_view(view, clip_axes)
-                    frame_bgr[~box_mask(clip_bounds, clip_view, K_display, width, height)] = 0
                     draw_box(frame_bgr, clip_bounds, clip_view, K_display)
                 cached_view = view.copy()
             cached_size = size

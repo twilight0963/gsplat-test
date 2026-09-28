@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 from threading import Thread
 from unittest.mock import Mock, patch
@@ -22,6 +23,15 @@ from src.live_viewer import PreviewPublisher
 from src.training_control import read_state, request_stop, training_active
 from src.upload_server import Jobs, StopRejected, make_server
 from src.viewer_http import ViewerHTTP, code_version
+
+
+def setUpModule():
+    # Jobs.reserve() clears the model downloads; keep tests away from the real runs/.downloads.
+    downloads = tempfile.TemporaryDirectory()
+    patcher = patch.object(upload_server, 'DOWNLOADS_DIR', Path(downloads.name))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(downloads.cleanup)
 
 
 class StopChannelTests(unittest.TestCase):
@@ -244,7 +254,10 @@ class UploadStopTests(unittest.TestCase):
         state = jobs.snapshot()
         self.assertEqual(state['stage'], 'done')
         self.assertIn('Model saved (stopped early)', state['status'])
-        self.assertTrue((output / 'model.glb').exists())
+        self.assertFalse(output.exists())  # packaged into the download, then removed
+        self.assertEqual(state['download'], output.name + '.zip')
+        with zipfile.ZipFile(upload_server.DOWNLOADS_DIR / state['download']) as bundle:
+            self.assertEqual(bundle.namelist(), [f'{output.name}/model.glb'])
         self.assertFalse(upload.exists())
 
     def test_rejected_stops(self):
