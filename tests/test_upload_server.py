@@ -1,10 +1,13 @@
 import io
 import json
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from threading import Thread
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from src.upload_server import Jobs, parameters, make_server
 
@@ -70,3 +73,82 @@ class UploadTests(unittest.TestCase):
                 self.assertTrue(json.load(response)['busy'])
         finally:
             server.shutdown();server.server_close();thread.join()
+
+
+class CustomArgumentsTests(unittest.TestCase):
+    def output(self):
+        return 'output=runs/test-' + uuid.uuid4().hex
+
+    def test_custom_parser_takes_no_paths_or_server_options(self):
+        from src.upload_server import SERVER_OPTIONS, custom_parser
+        parser = custom_parser()
+        flags = {flag for action in parser._actions for flag in action.option_strings}
+        self.assertFalse(flags & set(SERVER_OPTIONS))
+        for action in parser._actions:
+            if action.option_strings:
+                # Only numbers, listed choices and flags: nothing that names a file.
+                self.assertTrue(action.type in (int, float) or action.choices or action.nargs == 0, action.dest)
+
+    def test_custom_arguments_are_rebuilt_from_typed_values(self):
+        from src.upload_server import custom_arguments
+        self.assertEqual(custom_arguments('--steps 5000 --every 5 --max-width 1920 --brightness 0 '
+                                          '--contrast 1 --sharpness 0.5'), {})  # the engine defaults
+        self.assertEqual(custom_arguments('--steps=7000 --brightness -12 --no-unsharp --device cpu --no-colmap-cache'),
+                         {'steps': '7000', 'brightness': '-12.0', 'no-unsharp': None, 'device': 'cpu',
+                          'no-colmap-cache': None})
+
+    def test_custom_arguments_reject_anything_else(self):
+        from src.upload_server import custom_arguments
+        for text in ('--swin x', '--swinir-root=/tmp', '--sr-checkpoint /x', '--vocab-tree /x', '--output runs/x',
+                     '--use-server', '--headless', '--step 5', '--help', '-h', 'input.mp4', '-- /etc/passwd',
+                     '$(id)', '--steps 5; id', '--steps nan', '--brightness inf', '--densify other', '"unclosed',
+                     '--steps', 'x' * 5000):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                custom_arguments(text)
+
+    def test_parameters_with_custom_arguments(self):
+        p = parameters('args=' + quote('--steps 7000 --max-width 1280') + '&' + self.output())
+        self.assertEqual((p['steps'], p['max-width']), ('7000', '1280'))
+        self.assertIsNone(p['use-server'])
+        self.assertTrue(p['output'].startswith(str(Path(__file__).resolve().parent.parent / 'runs')))
+        for query in ('args=' + quote('--steps 0'), 'args=' + quote('--sharpness 2'),
+                      'args=' + quote('--steps 10') + '&steps=10', 'args=' + quote('--sr-tile 100 --super-resolution')):
+            with self.subTest(query=query), self.assertRaises(ValueError):
+                parameters(query + '&' + self.output())
+
+    def test_custom_super_resolution_uses_the_server_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, checkpoint = Path(tmp) / 'SwinIR', Path(tmp) / 'x2.pth'
+            with self.assertRaises(ValueError):
+                parameters('args=--super-resolution&' + self.output(), root, checkpoint)
+            (root / 'models').mkdir(parents=True)
+            (root / 'models/network_swinir.py').write_text('')
+            checkpoint.write_bytes(b'')
+            p = parameters('args=--super-resolution&' + self.output(), root, checkpoint)
+        self.assertEqual(p['swinir-root'], str(root.resolve()))
+        self.assertEqual(p['sr-checkpoint'], str(checkpoint.resolve()))
+        self.assertIn('super-resolution', p)
+
+    def test_page_help_and_check_endpoint(self):
+        jobs = Jobs()
+        jobs.launch = Mock()
+        server = make_server('127.0.0.1', 0, jobs, swinir_root='/nonexistent', sr_checkpoint='/nonexistent')
+        thread = Thread(target=server.serve_forever); thread.start()
+        base = f'http://127.0.0.1:{server.server_port}'
+        try:
+            with urlopen(base, timeout=2) as response:
+                page = response.read().decode()
+            self.assertNotIn('<!--engine-help-->', page)
+            self.assertIn('usage: python -m src.engine', page)
+            self.assertIn('data-sr-available="false"', page)
+            self.assertNotIn('--swinir-root SWINIR_ROOT', page)
+            with urlopen(base + '/check?args=' + quote('--steps 2000'), timeout=2) as response:
+                self.assertEqual(response.status, 200)
+            with self.assertRaises(HTTPError) as error:
+                urlopen(base + '/check?args=' + quote('--swinir-root /tmp'), timeout=2)
+            self.assertEqual(error.exception.code, 400)
+            self.assertIn('--swinir-root', json.load(error.exception)['error'])
+            jobs.launch.assert_not_called()
+            self.assertFalse(jobs.snapshot()['busy'])
+        finally:
+            server.shutdown(); server.server_close(); thread.join()

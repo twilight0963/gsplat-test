@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -30,6 +29,7 @@ from src.live_viewer import PreviewPublisher, ensure_viewer
 from src.gltf_gsplat import write_gsplat_glb
 from src.voxel_reconstruction import VoxelGuidedConfig, VoxelGuidedOptimizer
 from src.keyframes import select_keyframes
+from src.engine_cli import build_parser
 from src.image_dataset import ImageDataset, prepare_image_dataset
 from src.run_benchmark import benchmark_run, colmap_command, frame_counts, metrics, stage, timed, video_duration
 
@@ -1262,137 +1262,7 @@ def build_model(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build a Gaussian splat model from a drone video or image directory."
-    )
-    parser.add_argument("video", type=Path, metavar='INPUT', help='Video file or directory of photos (non-recursive).')
-    parser.add_argument("--output", type=Path, default=Path("runs/gsplat"))
-    parser.add_argument("--every", type=int, default=5,
-                        help="Keep every Nth video frame (videos only; see --photo-every for photo directories).")
-    parser.add_argument('--keyframe-max-gap', type=int, default=6,
-                        help='Video: maximum gap in candidates AFTER --every; 1 disables selection (default: 6).')
-    parser.add_argument('--keyframe-motion', type=float, default=.06,
-                        help='Video: tracked displacement / image diagonal triggering a keyframe (default: .06).')
-    parser.add_argument('--sequential-overlap', type=int, default=12,
-                        help='Video COLMAP matching overlap (default: 12).')
-    parser.add_argument('--mapper-tracks-per-view', type=int, default=1000,
-                        help='Tracks global_mapper keeps per image; fewer is faster (default: 1000, 0 = all).')
-    parser.add_argument('--eval-every', type=int, default=0,
-                        help='Hold out every Nth registered view and report PSNR/SSIM (0 = off, 8 is standard).')
-    parser.add_argument('--ssim-weight', type=float, default=0.2,
-                        help='D-SSIM weight in the training loss (0 = pure L1; ignored with SR).')
-    parser.add_argument('--no-scale-means-lr', dest='scale_means_lr', action='store_false',
-                        help='Do not scale the position learning rate by the scene extent.')
-    parser.add_argument("--photo-every", type=int, default=2,
-                        help="Use every Nth photo for SfM/training in image directories "
-                             "(default: 2; 1 uses all photos). Matching cost grows ~quadratically with image count.")
-    parser.add_argument('--image-matching', choices=('auto', 'exhaustive'), default='auto',
-                        help='Photos: GPS + sequential matching when all images have GPS; otherwise vocab-tree '
-                             '(if --vocab-tree is given), exhaustive for <=150 photos, or sequential.')
-    parser.add_argument('--spatial-neighbors', type=int, default=12,
-                        help='GPS nearest neighbors per photo in auto mode (default: 12).')
-    parser.add_argument("--max-features", type=int, default=4096,
-                        help="Max SIFT features per image (default: 4096).")
-    parser.add_argument("--gp-iterations", type=int, default=50,
-                        help="global_mapper position-solver iterations (lower = faster).")
-    parser.add_argument("--ba-iterations", type=int, default=3,
-                        help="global_mapper bundle-adjustment rounds (lower = faster).")
-    parser.add_argument("--no-colmap-cache", dest="colmap_cache", action="store_false",
-                        help="Always re-run COLMAP even if inputs and settings are unchanged.")
-    parser.add_argument("--max-width", type=int, default=1920)
-    parser.add_argument("--steps", type=int, default=5000,
-                        help="Training steps (default 5000: ~8 min for ~1800 video frames at 1280 px with MCMC).")
-    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--view-batch-size", type=int, default=None,
-                        help="Defaults to 1 with SR, otherwise 4.")
-    parser.add_argument("--max-points", type=int, default=200_000)
-    parser.add_argument("--densify", choices=("mcmc", "voxel"), default="mcmc",
-                        help="mcmc: relocate/grow Gaussians up to --max-gaussians (3DGS-MCMC); "
-                             "voxel: the earlier DroneSplat-style voxel growth.")
-    parser.add_argument("--max-gaussians", type=int, default=1_000_000,
-                        help="Gaussian budget (MCMC cap, and the voxel method's limit).")
-    parser.add_argument("--refine-every", type=int, default=50,
-                        help="MCMC: relocate and grow (by 5%%) every N steps.")
-    parser.add_argument("--max-axis-ratio", type=float, default=10.0,
-                        help="Axis ratio above which splats receive a soft shape penalty.")
-    parser.add_argument("--scale-regularization", type=float, default=0.01,
-                        help="Strength of the anti-streak shape penalty; 0 disables it.")
-    parser.add_argument("--vocab-tree", type=Path, default="vocab_tree.bin",
-                        help="COLMAP vocabulary tree (.bin). Enables retrieval matching for photos "
-                             "without GPS and loop detection for videos.")
-    parser.add_argument(
-        "--no-voxel-guided", dest="voxel_guided", action="store_false",
-        help="Disable the DroneSplat-style voxel-guided optimization (floater fix).",
-    )
-    parser.add_argument(
-        "--voxel-n", type=int, default=80,
-        help="Divide the scene's shortest bbox edge into this many voxels (paper's N).",
-    )
-    parser.add_argument(
-        "--voxel-tau", type=float, default=3.5,
-        help="Voxel-lengths a Gaussian may drift/scale before being flagged unconstrained.",
-    )
-    parser.add_argument(
-        "--voxel-gamma1", type=float, default=1e-4,
-        help="Accumulated world-space gradient norm needed to grow into an empty voxel "
-        "(scene-dependent - see src/voxel_guided.py's module docstring).",
-    )
-    parser.add_argument(
-        "--voxel-gamma2", type=int, default=2,
-        help="Prune sparse voxels only when their average opacity is also below voxel-gamma3.",
-    )
-    parser.add_argument(
-        "--voxel-gamma3", type=float, default=0.075,
-        help="Average opacity threshold for pruning sparse voxels.",
-    )
-    parser.add_argument(
-        "--voxel-stride", type=int, default=1,
-        help="Record visibility/accumulate voxel statistics every N steps (1 = every step).",
-    )
-    parser.add_argument(
-        "--means-lr", type=float, default=1.6e-4,
-        help="Initial learning rate for Gaussian positions.",
-    )
-    parser.add_argument(
-        "--means-lr-final-ratio", type=float, default=0.01,
-        help="Means LR is annealed exponentially to (means-lr * this ratio) by the last step.",
-    )
-    parser.add_argument(
-        "--opacity-reset-interval", type=int, default=3000,
-        help="Reset all opacities every N steps to flush unearned floaters. 0 disables.",
-    )
-    parser.add_argument(
-        "--no-mixed-precision", dest="mixed_precision", action="store_false",
-        help="Disable bf16 autocast during rasterization/loss (CUDA only).",
-    )
-    parser.add_argument(
-        "--brightness", type=float, default=0.0,
-        help="Added to every pixel in 0-255 units (0 = unchanged).",
-    )
-    parser.add_argument(
-        "--contrast", type=float, default=1.0
-    )
-    parser.add_argument(
-        "--sharpness", type=float, default=0.5
-    )
-    parser.add_argument("--super-resolution", action="store_true",
-                        help="Use tiled SwinIR 2x, CAS and dual-resolution supervision.")
-    default_root = Path(__file__).resolve().parent.parent
-    parser.add_argument("--swinir-root", type=Path,
-                        default=default_root / "third_party" / "SwinIR",
-                        help="Official SwinIR source checkout (same default as upload_server).")
-    parser.add_argument("--sr-checkpoint", type=Path,
-                        default=default_root / "weights" / "swinir-lightweight-x2.pth",
-                        help="SwinIR-S lightweight 2x checkpoint (same default as upload_server).")
-    parser.add_argument("--sr-tile", type=int, default=128, help="Input tile size, multiple of 8, >= 32.")
-    parser.add_argument("--sr-prior-weight", type=float, default=0.5,
-                        help="Enhanced target weight; remaining weight anchors to base images.")
-    parser.add_argument("--unsharp", action=argparse.BooleanOptionalAction, default=None,
-                        help="Unsharp masking: defaults off with SR, on otherwise.")
-    parser.add_argument("--use-server", action="store_true",
-                        help="Use the persistent browser viewer (used by upload_server).")
-    parser.add_argument("--headless", action="store_true",
-                        help="No live viewer or preview snapshots (fastest; use for benchmarking).")
+    parser = build_parser()
     args = parser.parse_args()
     voxel_config = VoxelGuidedConfig(
         n_along_shortest=args.voxel_n,

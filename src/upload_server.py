@@ -1,12 +1,15 @@
 """Browser upload interface for the existing engine CLI."""
 import argparse
+import html
 import json
 import math
 import re
+import shlex
 import shutil
 import struct
 import subprocess
 import sys
+import textwrap
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +17,7 @@ from threading import Lock, Thread, Timer
 from urllib.parse import parse_qs, urlsplit
 import socket
 
+from src.engine_cli import build_parser
 from src.training_control import STOP_ACTIONS, request_stop
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,19 +40,121 @@ PHOTO_BATCH = 'application/x-photo-batch'
 # Must match the engine's photo import (src/image_dataset.py).
 PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
 MAX_PHOTOS = 20000
+# Settings the page sends as individual query parameters: name, default, range, type.
+SETTINGS = (
+    ('steps', '5000', 1, 1000000, int), ('every', '5', 1, 100000, int),
+    ('max-width', '1920', 0, 16384, int), ('brightness', '0', -255, 255, float),
+    ('contrast', '1', 0, 10, float), ('sharpness', '.5', 0, 1, float),
+    ('photo-every', '2', 1, 1000, int),
+)
+# Engine options a browser may not pass in custom arguments: --output has its own
+# validated field, paths are configured by the server operator (--swinir-root and
+# --sr-checkpoint point at code the engine imports), and every upload job uses the
+# persistent viewer.
+SERVER_OPTIONS = ('--output', '--vocab-tree', '--swinir-root', '--sr-checkpoint', '--use-server', '--headless')
+MAX_ARGS_LENGTH = 4000
+
+
+class _ArgumentsRejected(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(f'Invalid arguments: {message}')
+
+
+class _HelpFormatter(argparse.HelpFormatter):
+    """Keeps option names like --photo-every whole when wrapping."""
+    def __init__(self, prog):
+        super().__init__(prog, width=82, max_help_position=30)
+
+    def _split_lines(self, text, width):
+        return textwrap.wrap(' '.join(text.split()), width, break_on_hyphens=False)
+
+
+def custom_parser():
+    """The engine's parser without SERVER_OPTIONS, for the page's custom mode and its help text.
+
+    Abbreviations are disabled so that, e.g., --swin cannot reach --swinir-root.
+    """
+    return build_parser(
+        exclude=SERVER_OPTIONS, parser_class=_ArgumentsRejected, prog='python -m src.engine',
+        add_help=False, allow_abbrev=False,
+        formatter_class=_HelpFormatter,
+        epilog='--output comes from the Output folder field and --use-server is always added. '
+               'Paths (--vocab-tree, --swinir-root, --sr-checkpoint) are set by the server.')
+
+
+def custom_arguments(text):
+    """Validate custom-mode engine arguments; return them as {option: value or None}.
+
+    The command is rebuilt from the parsed, typed values rather than passed through,
+    so only known option names and numbers or listed choices ever reach the engine.
+    """
+    if len(text) > MAX_ARGS_LENGTH:
+        raise ValueError(f'Arguments must be at most {MAX_ARGS_LENGTH} characters')
+    try:
+        tokens = shlex.split(text)
+    except ValueError as exc:
+        raise ValueError(f'Invalid arguments: {exc}') from None
+    for token in tokens:
+        if token.split('=', 1)[0] in SERVER_OPTIONS:
+            name = token.split('=', 1)[0]
+            raise ValueError(f'{name} cannot be set here: ' + (
+                'use the Output folder field.' if name == '--output' else 'the server sets it.'))
+    parser = custom_parser()
+    namespace = parser.parse_args(['INPUT', *tokens])
+    result = {}
+    for action in parser._actions:
+        if not action.option_strings:
+            continue
+        value = getattr(namespace, action.dest)
+        if value == action.default:
+            continue
+        flag = action.option_strings[0][2:]
+        if isinstance(action, argparse.BooleanOptionalAction):
+            result[flag if value else 'no-' + flag] = None
+        elif isinstance(value, bool):  # store_true / store_false
+            result[flag] = None
+        elif (isinstance(value, (int, float)) and math.isfinite(value)) \
+                or (action.choices is not None and value in action.choices):
+            result[flag] = str(value)
+        else:
+            raise ValueError(f'Invalid value for --{flag}: {value}')
+    return result
+
+
+def sr_paths(swinir_root=None, sr_checkpoint=None):
+    """The server's SwinIR source and checkpoint, or ValueError if they are not installed."""
+    root = Path(swinir_root) if swinir_root is not None else ROOT / 'third_party/SwinIR'
+    checkpoint = Path(sr_checkpoint) if sr_checkpoint is not None else ROOT / 'weights/swinir-lightweight-x2.pth'
+    if not (root / 'models/network_swinir.py').is_file() or not checkpoint.is_file():
+        raise ValueError('Super-resolution is not configured. Install SwinIR and its 2x weights on the server; see README.md.')
+    return root.resolve(), checkpoint.resolve()
+
+
+def _check_sr(tile, weight):
+    if tile < 32 or tile > 512 or tile % 8:
+        raise ValueError('SR tile size must be a multiple of 8 between 32 and 512')
+    if not math.isfinite(weight) or not 0 <= weight <= 1:
+        raise ValueError('SR prior weight must be between 0 and 1')
 
 
 def parameters(query, swinir_root=None, sr_checkpoint=None):
     values = parse_qs(query, strict_parsing=True)
     if any(len(items) != 1 for items in values.values()):
         raise ValueError('Duplicate upload parameters are not allowed')
+    if 'args' in values:
+        if set(values) - {'args', 'output'}:
+            raise ValueError('Send either custom arguments or individual settings, not both')
+        result = custom_arguments(values['args'][0])
+        for name, _default, lower, upper, _kind in SETTINGS:
+            if name in result and not lower <= float(result[name]) <= upper:
+                raise ValueError(f'Invalid --{name}: expected {lower} to {upper}')
+        if 'super-resolution' in result:
+            _check_sr(int(result.get('sr-tile', 128)), float(result.get('sr-prior-weight', 0.5)))
+            root, checkpoint = sr_paths(swinir_root, sr_checkpoint)
+            result.update({'swinir-root': str(root), 'sr-checkpoint': str(checkpoint)})
+        return _add_output(result, values)
     result = {}
-    for name, default, lower, upper, kind in (
-        ('steps', '5000', 1, 1000000, int), ('every', '5', 1, 100000, int),
-        ('max-width', '1920', 0, 16384, int), ('brightness', '0', -255, 255, float),
-        ('contrast', '1', 0, 10, float), ('sharpness', '.5', 0, 1, float),
-        ('photo-every', '2', 1, 1000, int),
-    ):
+    for name, default, lower, upper, kind in SETTINGS:
         value = kind(values.get(name, [default])[0])
         if not math.isfinite(value) or not lower <= value <= upper:
             raise ValueError(f'Invalid {name}: expected {lower} to {upper}')
@@ -63,20 +169,18 @@ def parameters(query, swinir_root=None, sr_checkpoint=None):
         result['unsharp' if unsharp == 'on' else 'no-unsharp'] = None
     if sr == 'true':
         tile = int(values.get('sr-tile', ['128'])[0])
-        if tile < 32 or tile > 512 or tile % 8:
-            raise ValueError('SR tile size must be a multiple of 8 between 32 and 512')
         weight = float(values.get('sr-prior-weight', ['0.5'])[0])
-        if not math.isfinite(weight) or not 0 <= weight <= 1:
-            raise ValueError('SR prior weight must be between 0 and 1')
+        _check_sr(tile, weight)
         # These executable-source paths are configured by the server operator,
         # never taken from the browser request.
-        root = Path(swinir_root) if swinir_root is not None else ROOT / 'third_party/SwinIR'
-        checkpoint = Path(sr_checkpoint) if sr_checkpoint is not None else ROOT / 'weights/swinir-lightweight-x2.pth'
-        if not (root / 'models/network_swinir.py').is_file() or not checkpoint.is_file():
-            raise ValueError('Super-resolution is not configured. Install SwinIR and its 2x weights on the server; see README.md.')
-        result.update({'super-resolution': None, 'swinir-root': str(root.resolve()),
-                       'sr-checkpoint': str(checkpoint.resolve()), 'sr-tile': str(tile),
+        root, checkpoint = sr_paths(swinir_root, sr_checkpoint)
+        result.update({'super-resolution': None, 'swinir-root': str(root),
+                       'sr-checkpoint': str(checkpoint), 'sr-tile': str(tile),
                        'sr-prior-weight': str(weight)})
+    return _add_output(result, values)
+
+
+def _add_output(result, values):
     output = values.get('output', ['runs/web-' + uuid.uuid4().hex[:8]])[0]
     path = (ROOT / output).resolve()
     if not path.is_relative_to(ROOT / 'runs') or path == ROOT / 'runs':
@@ -345,7 +449,14 @@ class Jobs:
 
 
 def make_server(host, port, jobs, *, swinir_root=None, sr_checkpoint=None):
-    page = Path(__file__).with_name('upload.html').read_bytes()
+    try:
+        sr_paths(swinir_root, sr_checkpoint)
+        sr_available = 'true'
+    except ValueError:
+        sr_available = 'false'
+    page = (Path(__file__).with_name('upload.html').read_text(encoding='utf-8')
+            .replace('<!--engine-help-->', html.escape(custom_parser().format_help().rstrip()))
+            .replace('data-sr-available="?"', f'data-sr-available="{sr_available}"')).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -368,6 +479,14 @@ def make_server(host, port, jobs, *, swinir_root=None, sr_checkpoint=None):
                 self.reply(200, page, 'text/html; charset=utf-8')
             elif path == '/status':
                 self.reply(200, json.dumps(jobs.snapshot()).encode())
+            elif path == '/check':
+                # Validates upload settings before the page sends a large file.
+                try:
+                    parameters(urlsplit(self.path).query, swinir_root, sr_checkpoint)
+                except ValueError as exc:
+                    self.reply(400, json.dumps({'error': str(exc)}).encode())
+                else:
+                    self.reply(200, b'{"ok":true}')
             else:
                 self.reply(404, b'{}')
 
@@ -402,7 +521,7 @@ def make_server(host, port, jobs, *, swinir_root=None, sr_checkpoint=None):
                     raise ValueError('Expected a video or photo upload')
                 photos = kind == PHOTO_BATCH
                 # --every applies to video frames, --photo-every to photo folders.
-                params.pop('every' if photos else 'photo-every')
+                params.pop('every' if photos else 'photo-every', None)
                 jobs.reserve()
                 reserved = True
                 directory = ROOT / 'runs' / '.uploads'

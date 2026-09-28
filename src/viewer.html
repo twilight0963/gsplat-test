@@ -2,55 +2,85 @@
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Flyby Render — Viewer</title>
 <style>
-/* Catppuccin Latte (catppuccin.com/palette) */
-:root{--mauve:#8839ef;--red:#d20f39;--green:#40a02b;--blue:#1e66f5;--lavender:#7287fd;--yellow:#df8e1d;
---text:#4c4f69;--subtext1:#5c5f77;--subtext0:#6c6f85;--overlay1:#8c8fa1;--overlay0:#9ca0b0;--surface2:#acb0be;--surface1:#bcc0cc;--surface0:#ccd0da;--base:#eff1f5;--mantle:#e6e9ef;--crust:#dce0e8;
---accent:var(--mauve);--accent-hover:#7832d2;--ease:cubic-bezier(.2,.8,.2,1);--glass:rgba(239,241,245,.8)}
+/* Catppuccin Latte (catppuccin.com/palette), in the same skeuomorphic style as upload.html */
+:root{--pink:#ea76cb;--mauve:#8839ef;--red:#d20f39;--maroon:#e64553;--green:#40a02b;--blue:#1e66f5;--lavender:#7287fd;--yellow:#df8e1d;
+--text:#4c4f69;--subtext1:#5c5f77;--subtext0:#6c6f85;--overlay2:#7c7f93;--overlay1:#8c8fa1;--overlay0:#9ca0b0;--surface2:#acb0be;--surface1:#bcc0cc;--surface0:#ccd0da;--base:#eff1f5;--mantle:#e6e9ef;--crust:#dce0e8;
+--accent:var(--mauve);--ease:cubic-bezier(.2,.8,.2,1);
+--gloss:linear-gradient(180deg,rgba(255,255,255,.34),rgba(255,255,255,0) 55%);
+--candy:linear-gradient(120deg,var(--mauve),#b24fd6 60%,var(--pink));
+--raised:linear-gradient(180deg,#fff,#f1f2f6);
+--raised-hover:linear-gradient(180deg,#fff,#e9ebf1);
+--recessed:linear-gradient(180deg,#eceef3,#f7f8fa);
+--glass:linear-gradient(180deg,rgba(255,255,255,.72),rgba(239,241,245,.66));
+--card:linear-gradient(180deg,#fff,#fbfbfd 55%,#f6f7fa);
+--shadow-raised:inset 0 1px 0 #fff,0 1px 2px rgba(76,79,105,.14),0 0 0 1px rgba(76,79,105,.04);
+--shadow-recessed:inset 0 1px 3px rgba(76,79,105,.16),inset 0 0 0 1px rgba(76,79,105,.04);
+--shadow-card:inset 0 1px 0 #fff,0 0 0 1px rgba(76,79,105,.07),0 1px 2px rgba(76,79,105,.06),0 12px 28px -10px rgba(76,79,105,.25)}
+/* Icons: a subset of Symbols Nerd Font (nerdfonts.com, MIT; glyphs from Font Awesome, OFL-1.1, Material
+   Design Icons, Apache-2.0, and Weather Icons, OFL-1.1), embedded so they show on devices without Nerd Fonts.
+   upload.html and viewer.html embed the same subset. Rebuild: pyftsubset SymbolsNerdFont-Regular.ttf
+   --unicodes=U+F008,U+F02F9,U+F1D8,U+F0434,U+F0674,U+F018D,U+F0464,U+F01BE,U+F06EC,U+F06ED,U+F0465,U+F0467,U+E343,U+F04E2,U+F06A1,U+F1542
+   --flavor=woff --no-hinting --desubroutinize --layout-features= --name-IDs= */
+@font-face{font-family:'Flyby Icons';src:url(data:font/woff;base64,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) format('woff');font-display:block}
+.nf{font-family:'Flyby Icons';font-style:normal;font-weight:normal;line-height:1;-webkit-font-smoothing:antialiased}
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;display:grid;grid-template-rows:auto 1fr;background:var(--crust);color:var(--text);font:100%/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
+body{margin:0;display:grid;grid-template-rows:auto 1fr;color:var(--text);font:100%/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;background:
+ radial-gradient(900px 520px at 6% -8%,rgba(234,118,203,.17),transparent 62%),
+ radial-gradient(820px 520px at 100% 0%,rgba(114,135,253,.2),transparent 60%),
+ radial-gradient(900px 640px at 40% 112%,rgba(23,146,153,.12),transparent 62%),
+ linear-gradient(180deg,#f5f6fa,var(--base) 40%,var(--mantle))}
 [hidden]{display:none!important}
 button{font:inherit;color:inherit}
-.topbar{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;padding:.6rem clamp(.75rem,3vw,1.5rem);padding-top:max(.6rem,env(safe-area-inset-top));background:var(--glass);backdrop-filter:blur(18px) saturate(170%);-webkit-backdrop-filter:blur(18px) saturate(170%);box-shadow:0 1px 0 rgba(76,79,105,.1);z-index:3}
-.title{font-weight:650;letter-spacing:-.01em;margin-right:.25rem}
-.pill{display:inline-flex;align-items:center;gap:.5rem;min-height:2rem;padding:0 .8rem;border-radius:1rem;background:#fff;border:1px solid var(--crust);font-size:.85rem;font-variant-numeric:tabular-nums}
-.pill .dot{width:.55rem;height:.55rem;border-radius:50%;background:var(--overlay0)}
-.pill.training .dot{background:var(--accent)}.pill.saved .dot{background:var(--green)}.pill.problem .dot{background:var(--red)}
-.pill .bar{width:4.5rem;height:.35rem;border-radius:.2rem;background:var(--mantle);overflow:hidden}
-.pill .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s var(--ease)}
+.topbar{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;padding:.6rem clamp(.75rem,3vw,1.5rem);padding-top:max(.6rem,env(safe-area-inset-top));background:var(--glass);backdrop-filter:blur(18px) saturate(170%);-webkit-backdrop-filter:blur(18px) saturate(170%);
+ box-shadow:inset 0 -1px 0 rgba(255,255,255,.7),0 1px 0 rgba(76,79,105,.08),0 6px 18px -12px rgba(76,79,105,.3);z-index:3}
+.brand{display:flex;align-items:center;gap:.55rem;margin-right:.25rem}
+.brand svg{flex:none}
+.title{font-weight:650;letter-spacing:-.01em;background:linear-gradient(100deg,var(--text) 30%,var(--mauve) 75%,var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
+.pill{display:inline-flex;align-items:center;gap:.5rem;min-height:2rem;padding:0 .8rem;border-radius:1rem;background:var(--raised);box-shadow:var(--shadow-raised);font-size:.85rem;font-variant-numeric:tabular-nums}
+.pill .dot{width:.6rem;height:.6rem;border-radius:50%;background:var(--overlay0);box-shadow:inset 0 1px 0 rgba(255,255,255,.5)}
+.pill.training .dot{background:var(--gloss),var(--candy)}
+.pill.saved .dot{background:radial-gradient(circle at 35% 30%,#8fd67c,var(--green))}
+.pill.problem .dot{background:radial-gradient(circle at 35% 30%,#f2708a,var(--red))}
+.pill .bar{width:4.5rem;height:.45rem;border-radius:.25rem;background:var(--recessed);box-shadow:var(--shadow-recessed);overflow:hidden}
+.pill .bar>i{display:block;height:100%;width:0;background:var(--gloss),var(--candy);transition:width .3s var(--ease)}
 .spacer{flex:1}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;min-height:2.25rem;padding:0 .85rem;border-radius:10px;border:1px solid var(--surface0);background:#fff;font-weight:600;font-size:.875rem;cursor:pointer;transition:transform .1s ease-out,background .15s var(--ease)}
-.btn:hover{background:var(--base)}
-.btn:active{transform:scale(.96)}
+/* Buttons: raised, glossy, pressed in on :active */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;min-height:2.25rem;padding:0 .85rem;border-radius:11px;border:1px solid var(--surface0);background:var(--raised);box-shadow:var(--shadow-raised);font-weight:600;font-size:.875rem;cursor:pointer;
+ transition:transform .1s ease-out,background .15s var(--ease),border-color .15s var(--ease),box-shadow .15s var(--ease)}
+.btn:hover{background:var(--raised-hover);border-color:var(--surface1)}
+.btn:active{transform:scale(.96);background:linear-gradient(180deg,#e6e9ef,#f1f2f6);box-shadow:inset 0 1px 3px rgba(76,79,105,.22)}
 .btn:focus-visible,.tool:focus-visible,.segmented input:focus-visible+label{outline:2px solid var(--lavender);outline-offset:2px}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover{background:var(--accent-hover)}
+.btn.primary{border:0;background:var(--gloss),var(--candy);color:#fff;text-shadow:0 1px 1px rgba(76,20,140,.35);box-shadow:0 3px 8px -2px rgba(136,57,239,.5),0 10px 20px -10px rgba(234,118,203,.8)}
+.btn.primary:hover{background:linear-gradient(180deg,rgba(255,255,255,.42),rgba(255,255,255,0) 55%),var(--candy)}
+.btn.primary:active{background:linear-gradient(180deg,rgba(76,20,140,.12),rgba(255,255,255,0) 60%),var(--candy);box-shadow:inset 0 2px 4px rgba(76,20,140,.35)}
 .btn.danger{color:var(--red);border-color:#f0b7c3}
-.btn.danger:hover{background:#fdecef}
-.btn.danger.confirm{background:var(--red);border-color:var(--red);color:#fff}
+.btn.danger:hover{background:linear-gradient(180deg,#fff,#fdecef)}
+.btn.danger.confirm{border-color:#b00d31;background:var(--gloss),linear-gradient(120deg,var(--red),var(--maroon));color:#fff;text-shadow:0 1px 1px rgba(100,0,20,.35)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .stage{position:relative;min-height:0;display:grid;place-items:center;padding:.75rem .75rem 5.75rem}
-#view{width:100%;height:100%;object-fit:contain;border-radius:12px;background:#000;box-shadow:0 10px 40px rgba(76,79,105,.25);touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-user-drag:none;cursor:grab}
+#view{width:100%;height:100%;object-fit:contain;border-radius:16px;background:#000;box-shadow:0 0 0 1px rgba(76,79,105,.1),0 14px 40px -12px rgba(76,79,105,.4);touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-user-drag:none;cursor:grab}
 #view.dragging{cursor:grabbing}
 .placeholder{position:absolute;inset:0;display:grid;place-items:center;color:var(--subtext0);font-size:.95rem;pointer-events:none}
-/* Floating toolbar */
-.toolbar{position:fixed;left:50%;bottom:max(.9rem,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;justify-content:center;max-width:calc(100vw - 1.5rem);padding:.4rem;border-radius:16px;background:var(--glass);backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);border:1px solid rgba(255,255,255,.6);box-shadow:0 8px 30px rgba(76,79,105,.22);z-index:4}
+/* Floating toolbar: a glass tray; tools are raised when open and pressed in while held */
+.toolbar{position:fixed;left:50%;bottom:max(.9rem,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;justify-content:center;width:max-content;max-width:calc(100vw - 1.5rem);padding:.4rem;border-radius:18px;background:var(--glass);backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);
+ border:1px solid rgba(255,255,255,.7);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 0 0 1px rgba(76,79,105,.06),0 12px 30px -8px rgba(76,79,105,.35);z-index:4}
 .group{display:flex;align-items:center;gap:.15rem}
-.sep{width:1px;height:1.6rem;background:var(--surface0);margin:0 .2rem}
-.tool{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:.1rem;min-width:3.1rem;height:3rem;padding:0 .45rem;border:0;border-radius:10px;background:transparent;cursor:pointer;color:var(--text);transition:background .15s var(--ease),transform .1s ease-out}
-.tool:hover{background:rgba(255,255,255,.75)}
-.tool:active,.tool.pressed{background:#fff;transform:scale(.95)}
-.tool[aria-expanded=true]{background:#fff}
-.tool svg{width:1.25rem;height:1.25rem}
+.sep{width:1px;height:1.6rem;background:var(--surface0);box-shadow:1px 0 0 #fff;margin:0 .2rem}
+.tool{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:.2rem;min-width:3.1rem;height:3rem;padding:0 .45rem;border:0;border-radius:11px;background:transparent;cursor:pointer;color:var(--text);transition:background .15s var(--ease),box-shadow .15s var(--ease),transform .1s ease-out}
+.tool:hover{background:var(--raised);box-shadow:var(--shadow-raised)}
+.tool:active,.tool.pressed{background:var(--recessed);box-shadow:var(--shadow-recessed);transform:scale(.95)}
+.tool[aria-expanded=true]{background:var(--raised);box-shadow:var(--shadow-raised);color:var(--mauve)}
+.tool i{font-size:1.3rem}
 .tool span{font-size:.68rem;font-weight:600;color:var(--subtext1);letter-spacing:.01em}
-.segmented{display:inline-flex;padding:3px;border-radius:10px;background:rgba(204,208,218,.55)}
+.segmented{display:inline-flex;padding:3px;border-radius:12px;background:var(--recessed);box-shadow:var(--shadow-recessed)}
 .segmented input{position:absolute;opacity:0;pointer-events:none}
-.segmented label{display:inline-flex;align-items:center;gap:.35rem;height:2.4rem;padding:0 .75rem;border-radius:8px;font-size:.82rem;font-weight:600;color:var(--subtext1);cursor:pointer;transition:background .15s var(--ease),color .15s var(--ease)}
-.segmented label svg{width:1.05rem;height:1.05rem}
-.segmented input:checked+label{background:#fff;color:var(--text);box-shadow:0 1px 3px rgba(76,79,105,.2)}
-@media(max-width:640px){.tool span,.segmented label span{display:none}.tool{min-width:2.6rem;height:2.6rem}}
+.segmented label{display:inline-flex;align-items:center;gap:.4rem;height:2.4rem;padding:0 .75rem;border-radius:9px;font-size:.82rem;font-weight:600;color:var(--subtext1);cursor:pointer;transition:background .15s var(--ease),color .15s var(--ease),box-shadow .15s var(--ease)}
+.segmented label i{font-size:1.15rem}
+.segmented input:checked+label{background:var(--raised);color:var(--text);box-shadow:var(--shadow-raised)}
+@media(max-width:640px){.tool span,.segmented label span,.sep{display:none}.tool{min-width:2.6rem;height:2.6rem}}
 /* Popover and help sheet */
-.popover{position:fixed;left:50%;bottom:5.4rem;transform:translateX(-50%);width:min(24rem,calc(100vw - 1.5rem));padding:1rem 1.1rem;border-radius:14px;background:#fff;border:1px solid var(--crust);box-shadow:0 12px 40px rgba(76,79,105,.25);z-index:5;transform-origin:50% 100%;animation:pop .18s var(--ease)}
+.popover{position:fixed;left:50%;bottom:5.4rem;transform:translateX(-50%);width:min(24rem,calc(100vw - 1.5rem));padding:1rem 1.1rem;border-radius:16px;background:var(--card);border:1px solid rgba(255,255,255,.9);box-shadow:var(--shadow-card);z-index:5;transform-origin:50% 100%;animation:pop .18s var(--ease)}
 @keyframes pop{from{opacity:0;transform:translateX(-50%) scale(.96)}to{opacity:1;transform:translateX(-50%) scale(1)}}
 .popover h2{margin:0 0 .6rem;font-size:.95rem}
 .popover label{display:flex;justify-content:space-between;font-size:.875rem;font-weight:600}
@@ -58,18 +88,18 @@ button{font:inherit;color:inherit}
 .popover input[type=range]{width:100%;margin:.6rem 0 .3rem;accent-color:var(--accent)}
 .popover small{color:var(--subtext0);font-size:.8rem}
 .help{bottom:auto;top:4rem;width:min(30rem,calc(100vw - 1.5rem));transform-origin:50% 0}
-.help dl{display:grid;grid-template-columns:auto 1fr;gap:.35rem 1rem;margin:0;font-size:.85rem}
+.help dl{display:grid;grid-template-columns:auto 1fr;gap:.45rem 1rem;margin:0;font-size:.85rem}
 .help dt{font-weight:600;white-space:nowrap}
 .help dd{margin:0;color:var(--subtext1)}
-kbd{display:inline-block;min-width:1.4em;padding:0 .35em;border:1px solid var(--surface1);border-bottom-width:2px;border-radius:5px;background:var(--base);font:600 .78rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}
-.toast{position:fixed;left:50%;top:4.2rem;transform:translateX(-50%);max-width:calc(100vw - 1.5rem);padding:.55rem .95rem;border-radius:10px;background:#fff;border:1px solid var(--crust);box-shadow:0 8px 24px rgba(76,79,105,.2);font-size:.875rem;z-index:6}
-.toast.error{color:#a30b2d;border-color:#f0b7c3}
+kbd{display:inline-block;min-width:1.5em;padding:0 .35em;border:1px solid var(--surface1);border-radius:6px;background:var(--raised);box-shadow:inset 0 1px 0 #fff,inset 0 -2px 0 rgba(76,79,105,.12),0 1px 1px rgba(76,79,105,.12);font:600 .78rem/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}
+.toast{position:fixed;left:50%;top:4.2rem;transform:translateX(-50%);max-width:calc(100vw - 1.5rem);padding:.55rem .95rem;border-radius:12px;background:var(--card);border:1px solid rgba(255,255,255,.9);box-shadow:var(--shadow-card);font-size:.875rem;z-index:6}
+.toast.error{color:#a30b2d;background:linear-gradient(180deg,#fff,#fdecef)}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}.btn:active,.tool:active,.tool.pressed{transform:none}}
 @media(prefers-reduced-transparency:reduce){.topbar,.toolbar{background:var(--base);backdrop-filter:none;-webkit-backdrop-filter:none}}
-@media(prefers-contrast:more){.btn,.pill,.toolbar,.popover{border-color:var(--subtext0)}}
+@media(prefers-contrast:more){.btn,.pill,.toolbar,.popover,.toast{border:1px solid var(--subtext0)}}
 </style>
 <header class="topbar">
- <span class="title">Flyby Viewer</span>
+ <span class="brand"><svg width="28" height="28" viewBox="0 0 38 38" aria-hidden="true"><defs><linearGradient id="logo-fill" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8839ef"/><stop offset=".6" stop-color="#b24fd6"/><stop offset="1" stop-color="#ea76cb"/></linearGradient><linearGradient id="logo-gloss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".38"/><stop offset=".55" stop-color="#fff" stop-opacity="0"/></linearGradient></defs><rect x="1" y="1" width="36" height="36" rx="11" fill="url(#logo-fill)"/><rect x="1" y="1" width="36" height="36" rx="11" fill="url(#logo-gloss)"/><path d="M9 24l6-8 5 5 4-6 5 9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="26" cy="11.5" r="2.4" fill="#fff"/><path d="M11 8.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" fill="#fff" opacity=".85"/></svg><span class="title">Flyby Viewer</span></span>
  <span class="pill" id="pill" role="status" aria-live="polite"><span class="dot"></span><span id="pill-text">Connecting…</span><span class="bar" id="pill-bar" hidden><i></i></span></span>
  <span class="spacer"></span>
  <button class="btn primary" id="stop-save" hidden title="End training now and save the model trained so far">Stop &amp; save</button>
@@ -82,25 +112,25 @@ kbd{display:inline-block;min-width:1.4em;padding:0 .35em;border:1px solid var(--
 </main>
 <nav class="toolbar" aria-label="Camera controls">
  <div class="segmented" role="radiogroup" aria-label="Drag moves the camera by">
-  <input type="radio" name="mode" id="mode-orbit" value="orbit" checked><label for="mode-orbit" title="Drag to orbit around the model (O)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><ellipse cx="12" cy="12" rx="9" ry="4"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/><path d="M19 8.5l2-1"/></svg><span>Orbit</span></label>
-  <input type="radio" name="mode" id="mode-pan" value="pan"><label for="mode-pan" title="Drag to slide the view (P)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18M3 12h18M12 3l-2.5 2.5M12 3l2.5 2.5M12 21l-2.5-2.5M12 21l2.5-2.5M3 12l2.5-2.5M3 12l2.5 2.5M21 12l-2.5-2.5M21 12l-2.5 2.5"/></svg><span>Pan</span></label>
+  <input type="radio" name="mode" id="mode-orbit" value="orbit" checked><label for="mode-orbit" title="Drag to orbit around the model (O)"><i class="nf" aria-hidden="true">&#xF0464;</i><span>Orbit</span></label>
+  <input type="radio" name="mode" id="mode-pan" value="pan"><label for="mode-pan" title="Drag to slide the view (P)"><i class="nf" aria-hidden="true">&#xF01BE;</i><span>Pan</span></label>
  </div>
  <span class="sep" aria-hidden="true"></span>
  <div class="group">
-  <button class="tool" data-action="zoom" data-dx="-1" data-repeat aria-label="Zoom out" title="Zoom out (−)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M20 20l-4-4"/></svg><span>Out</span></button>
-  <button class="tool" data-action="zoom" data-dx="1" data-repeat aria-label="Zoom in" title="Zoom in (+)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M11 8v6M20 20l-4-4"/></svg><span>In</span></button>
+  <button class="tool" data-action="zoom" data-dx="-1" data-repeat aria-label="Zoom out" title="Zoom out (−)"><i class="nf" aria-hidden="true">&#xF06EC;</i><span>Out</span></button>
+  <button class="tool" data-action="zoom" data-dx="1" data-repeat aria-label="Zoom in" title="Zoom in (+)"><i class="nf" aria-hidden="true">&#xF06ED;</i><span>In</span></button>
  </div>
  <span class="sep" aria-hidden="true"></span>
  <div class="group">
-  <button class="tool" data-action="left" data-repeat aria-label="Roll left" title="Roll left (Z)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4"/></svg><span>Roll</span></button>
-  <button class="tool" data-action="right" data-repeat aria-label="Roll right" title="Roll right (C)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v4h-4"/></svg><span>Roll</span></button>
-  <button class="tool" data-action="straighten" aria-label="Level the horizon" title="Level the horizon (X)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3 12h18"/><circle cx="12" cy="12" r="2.5"/><path d="M6 8v8M18 8v8"/></svg><span>Level</span></button>
-  <button class="tool" data-action="flip" aria-label="Flip upside down" title="Flip which way is up (U)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4v16M8 4L5 7M8 4l3 3M16 20V4M16 20l-3-3M16 20l3-3"/></svg><span>Flip</span></button>
+  <button class="tool" data-action="left" data-repeat aria-label="Roll left" title="Roll left (Z)"><i class="nf" aria-hidden="true">&#xF0465;</i><span>Roll</span></button>
+  <button class="tool" data-action="right" data-repeat aria-label="Roll right" title="Roll right (C)"><i class="nf" aria-hidden="true">&#xF0467;</i><span>Roll</span></button>
+  <button class="tool" data-action="straighten" aria-label="Level the horizon" title="Level the horizon (X)"><i class="nf" aria-hidden="true">&#xE343;</i><span>Level</span></button>
+  <button class="tool" data-action="flip" aria-label="Flip upside down" title="Flip which way is up (U)"><i class="nf" aria-hidden="true">&#xF04E2;</i><span>Flip</span></button>
  </div>
  <span class="sep" aria-hidden="true"></span>
  <div class="group">
-  <button class="tool" data-action="reset" aria-label="Reset view" title="Reset the camera (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span>Reset</span></button>
-  <button class="tool" id="display-button" aria-expanded="false" aria-controls="display" aria-label="Display settings" title="Display settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg><span>Display</span></button>
+  <button class="tool" data-action="reset" aria-label="Reset view" title="Reset the camera (R)"><i class="nf" aria-hidden="true">&#xF06A1;</i><span>Reset</span></button>
+  <button class="tool" id="display-button" aria-expanded="false" aria-controls="display" aria-label="Display settings" title="Display settings"><i class="nf" aria-hidden="true">&#xF1542;</i><span>Display</span></button>
  </div>
 </nav>
 <section class="popover" id="display" hidden aria-labelledby="display-title">
